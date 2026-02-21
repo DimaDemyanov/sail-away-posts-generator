@@ -7,6 +7,22 @@ This repository is being migrated to a TypeScript monorepo architecture:
 - `apps/bot`
 - `packages/core`
 
+## API MVP
+Run API locally:
+```bash
+npm run dev:api
+```
+
+Then:
+1. `POST /reindex` to load JSON history from `./history`
+2. `GET /plan/next10` to get the first 10-post plan
+
+Example:
+```bash
+curl -X POST http://localhost:3000/reindex
+curl http://localhost:3000/plan/next10
+```
+
 Lightweight project for generating "Sail Away" themed social media posts.
 
 ## Features

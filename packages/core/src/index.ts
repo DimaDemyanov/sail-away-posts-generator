@@ -5,3 +5,10 @@ export function healthcheck(): HealthStatus {
 }
 
 export { loadConfig, type AppConfig } from "./config";
+export {
+  loadHistoryFromDir,
+  type HistoryFile,
+  type HistoryPost,
+  type IndexedPost,
+} from "./history";
+export { buildNext10Plan, type PlanItem } from "./planner";
