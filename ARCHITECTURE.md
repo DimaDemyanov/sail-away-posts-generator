@@ -146,3 +146,59 @@ Bot should call API endpoints; keep LLM logic in backend services, not in bot ha
 4. Implement `GET /plan/next10`.
 5. Implement `POST /draft` with image options.
 6. Add Telegram bot commands wired to API.
+
+## Deployment
+
+### Objective
+Deploy with:
+- Telegram bot interface
+- JSON history from repository files
+- OpenAI model `gpt-5-mini` as default generation model
+
+### Environments
+- `local`: development and manual testing.
+- `prod`: always-on deployment for bot + API + worker.
+
+### Production Topology
+- `api`: HTTP endpoints for planning and draft generation.
+- `worker`: background jobs (`reindex-history`, `embed-posts`, `generate-plan-next10`, `generate-draft`).
+- `bot`: Telegram long-polling process.
+- `postgres`: application data.
+- `redis`: queue and job coordination.
+
+### Deployment Steps
+1. Provision PostgreSQL and Redis.
+2. Configure environment variables.
+3. Run DB migrations.
+4. Start API, worker, and bot processes.
+5. Trigger initial history reindex.
+6. Validate bot commands (`/plan10`, `/draft`).
+
+### Initial Data Bootstrap
+- Import all `history/**/*.json` into DB.
+- Generate embeddings for imported posts.
+- Run one `plan_next_10` generation to validate end-to-end flow.
+
+### Operations
+- Reindex when JSON history changes (manual or scheduled).
+- Monitor queue lag and job failures.
+- Keep generated plans/drafts for quality review.
+
+### Security
+- Store secrets in environment variables or a secret manager.
+- Never commit API keys or Telegram bot token.
+- Restrict sensitive bot commands to approved Telegram user IDs.
+
+### Cost Notes
+- Main variable cost is LLM token usage.
+- Defaulting to `gpt-5-mini` keeps generation cost lower than larger models.
+- Control cost by limiting retrieved context and avoiding unnecessary regenerations.
+
+### Minimal Launch Checklist
+- [ ] `OPENAI_API_KEY` configured.
+- [ ] `OPENAI_MODEL=gpt-5-mini` configured.
+- [ ] `DATABASE_URL` and `REDIS_URL` configured.
+- [ ] `TELEGRAM_BOT_TOKEN` configured.
+- [ ] DB migrations applied.
+- [ ] Initial reindex completed.
+- [ ] Bot responds to `/plan10`.
