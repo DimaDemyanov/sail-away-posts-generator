@@ -1,5 +1,12 @@
 # Sail Away Posts Generator
 
+## Repository Status
+This repository is being migrated to a TypeScript monorepo architecture:
+- `apps/api`
+- `apps/worker`
+- `apps/bot`
+- `packages/core`
+
 Lightweight project for generating "Sail Away" themed social media posts.
 
 ## Features

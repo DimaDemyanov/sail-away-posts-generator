@@ -1,0 +1,27 @@
+{
+  "name": "sail-away-posts-generator",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Telegram sailing content planner and draft generator",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run -ws build",
+    "dev": "npm run -ws dev",
+    "lint": "npm run -ws lint",
+    "typecheck": "npm run -ws typecheck",
+    "dev:api": "npm run -w @sail-away/api dev",
+    "dev:worker": "npm run -w @sail-away/worker dev",
+    "dev:bot": "npm run -w @sail-away/bot dev"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "tsx": "^4.20.4",
+    "typescript": "^5.9.2"
+  }
+}
