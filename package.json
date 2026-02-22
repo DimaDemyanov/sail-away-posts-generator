@@ -12,6 +12,7 @@
     "dev": "npm run -ws dev",
     "lint": "npm run -ws lint",
     "typecheck": "npm run -ws typecheck",
+    "test": "npm run -ws test --if-present",
     "dev:api": "npm run -w @sail-away/api dev",
     "dev:worker": "npm run -w @sail-away/worker dev",
     "dev:bot": "npm run -w @sail-away/bot dev"
