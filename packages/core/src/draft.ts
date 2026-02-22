@@ -131,14 +131,19 @@ function isSimilarSource(post: IndexedPost): boolean {
 }
 
 function tryBuildTelegramUrl(post: IndexedPost): string | undefined {
-  const filename = path.basename(post.sourceFile, path.extname(post.sourceFile));
-  const slug = filename.replace(/[^A-Za-z0-9_]/g, "");
-  if (!slug || !/^[A-Za-z0-9_]{5,}$/.test(slug)) {
-    return undefined;
-  }
   if (!/^\d+$/.test(post.id)) {
     return undefined;
   }
+
+  const filename = path.basename(post.sourceFile, path.extname(post.sourceFile));
+  const slug = filename
+    .toLowerCase()
+    .replace(/[^a-z0-9_]/g, "")
+    .replace(/^_+|_+$/g, "");
+  if (!slug || slug.length < 5) {
+    return undefined;
+  }
+
   return `https://t.me/s/${slug}/${post.id}`;
 }
 
