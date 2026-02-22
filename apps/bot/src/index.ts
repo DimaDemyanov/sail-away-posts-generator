@@ -1,4 +1,6 @@
 import { Markup, Telegraf } from "telegraf";
+import { mkdir, open, unlink } from "node:fs/promises";
+import path from "node:path";
 
 interface ApiQueueItem {
   rank: number;
@@ -63,21 +65,48 @@ function parseTargetChatId(raw: string | undefined): number | null {
 }
 
 async function apiFetch<T>(baseUrl: string, path: string, init?: RequestInit): Promise<T> {
-  const hasBody = init?.body !== undefined && init?.body !== null;
-  const res = await fetch(`${baseUrl}${path}`, {
-    ...init,
-    headers: {
-      ...(hasBody ? { "content-type": "application/json" } : {}),
-      ...(init?.headers ?? {}),
-    },
-  });
+  const maxAttempts = 3;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      const hasBody = init?.body !== undefined && init?.body !== null;
+      const res = await fetch(`${baseUrl}${path}`, {
+        ...init,
+        headers: {
+          ...(hasBody ? { "content-type": "application/json" } : {}),
+          ...(init?.headers ?? {}),
+        },
+      });
 
-  const body = (await res.json()) as T & { message?: string };
-  if (!res.ok) {
-    const message = body && typeof body === "object" && "message" in body ? body.message : "API request failed";
-    throw new Error(String(message));
+      const body = (await res.json()) as T & { message?: string };
+      if (!res.ok) {
+        const message = body && typeof body === "object" && "message" in body ? body.message : "API request failed";
+        throw new Error(String(message));
+      }
+      return body as T;
+    } catch (error) {
+      const e = error as Error & { cause?: { code?: string } };
+      const message = e.message ?? "";
+      const causeCode = e.cause?.code ?? "";
+      const retryableNetworkError =
+        message.includes("fetch failed") ||
+        causeCode === "UND_ERR_SOCKET" ||
+        causeCode === "ECONNRESET" ||
+        causeCode === "ECONNREFUSED" ||
+        causeCode === "ETIMEDOUT";
+      if (!retryableNetworkError || attempt === maxAttempts) {
+        throw error;
+      }
+      console.error("[apiFetch.retry]", {
+        path,
+        attempt,
+        maxAttempts,
+        message,
+        causeCode,
+      });
+      await sleep(300 * attempt);
+    }
   }
-  return body as T;
+  throw new Error("api_fetch_failed");
 }
 
 async function tryLoadLatestQueue(baseUrl: string): Promise<ApiLatestQueue | null> {
@@ -90,6 +119,14 @@ async function tryLoadLatestQueue(baseUrl: string): Promise<ApiLatestQueue | nul
   } catch {
     return null;
   }
+}
+
+function shouldRetryDraftError(message: string): boolean {
+  return /(^|\s)(429|500|502|503|504)(\s|$)/.test(message);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function ensureAllowed(userId: number, adminIds: Set<number>): boolean {
@@ -150,12 +187,42 @@ function getUtcNowParts(): { weekday: number; hour: number; minute: number; date
 }
 
 function getCurrentWeekItem(queue: ApiQueueItem[], dateKey: string): ApiQueueItem | null {
-  for (const item of queue) {
+  const sorted = [...queue].sort((a, b) => a.weekStart.localeCompare(b.weekStart));
+  for (const item of sorted) {
     if (item.weekStart <= dateKey && dateKey <= item.weekEnd) {
       return item;
     }
   }
-  return null;
+  const upcoming = sorted.find((item) => item.weekStart > dateKey);
+  if (upcoming) return upcoming;
+  return sorted.at(-1) ?? null;
+}
+
+async function acquireSchedulerLock(): Promise<{
+  acquired: boolean;
+  release: () => Promise<void>;
+}> {
+  const lockPath = path.resolve(process.cwd(), "data", ".bot-scheduler.lock");
+  await mkdir(path.dirname(lockPath), { recursive: true });
+  try {
+    const handle = await open(lockPath, "wx");
+    await handle.writeFile(String(process.pid));
+    const release = async (): Promise<void> => {
+      try {
+        await handle.close();
+      } catch {
+        // no-op
+      }
+      try {
+        await unlink(lockPath);
+      } catch {
+        // no-op
+      }
+    };
+    return { acquired: true, release };
+  } catch {
+    return { acquired: false, release: async () => undefined };
+  }
 }
 
 async function main(): Promise<void> {
@@ -170,6 +237,8 @@ async function main(): Promise<void> {
   const bot = new Telegraf(botToken);
   const replaceModeUsers = new Set<number>();
   const addTopicModeUsers = new Set<number>();
+  const handledReminderMessages = new Set<string>();
+  const queueTargets = (): number[] => (targetChatId ? [targetChatId] : Array.from(adminIds));
 
   const appendTopic = async (
     userId: number,
@@ -198,6 +267,86 @@ async function main(): Promise<void> {
     await reply([`Тема добавлена`, `queueId: ${res.queueId}`, "", ...lines].join("\n"));
   };
 
+  const sendDraftForCurrentWeek = async (chatIds: number[], dateKey: string): Promise<void> => {
+    const latest = await tryLoadLatestQueue(apiBaseUrl);
+    if (!latest?.queueId || !Array.isArray(latest.queue) || latest.queue.length === 0) return;
+    const current = getCurrentWeekItem(latest.queue, dateKey);
+    if (!current) return;
+
+    let draftRes: { status: string; draft: ApiDraft } | null = null;
+    const maxAttempts = 3;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        draftRes = await apiFetch<{ status: string; draft: ApiDraft }>(apiBaseUrl, "/draft", {
+          method: "POST",
+          body: JSON.stringify({
+            queueItem: current.rank,
+            queueId: latest.queueId,
+          }),
+        });
+        break;
+      } catch (error) {
+        const message = (error as Error).message;
+        const retryable = shouldRetryDraftError(message);
+        console.error("[scheduler:draft.api_error]", {
+          attempt,
+          maxAttempts,
+          retryable,
+          message,
+        });
+        if (!retryable || attempt === maxAttempts) {
+          throw error;
+        }
+        await sleep(800 * attempt);
+      }
+    }
+    if (!draftRes) {
+      return;
+    }
+    const message = [
+      "Черновик на текущую неделю",
+      `Тема #${current.rank}: ${current.topic}`,
+      `Неделя: ${current.weekStart} - ${current.weekEnd}`,
+      "",
+      draftRes.draft.text,
+    ].join("\n");
+    for (const chatId of chatIds) {
+      try {
+        await bot.telegram.sendMessage(chatId, message);
+        console.info("[scheduler:draft.sent]", { chatId, dateKey });
+      } catch (error) {
+        console.error("[scheduler:draft.send_error]", { chatId, dateKey, error });
+      }
+    }
+  };
+
+  const sendReminderForCurrentWeek = async (chatIds: number[], dateKey: string): Promise<void> => {
+    const latest = await tryLoadLatestQueue(apiBaseUrl);
+    if (!latest?.queueId || !Array.isArray(latest.queue) || latest.queue.length === 0) return;
+    const current = getCurrentWeekItem(latest.queue, dateKey);
+    if (!current) return;
+
+    const text = [
+      "Напоминание по теме поста на эту неделю",
+      `Тема #${current.rank}: ${current.topic}`,
+      "",
+      "Удалить эту тему из очереди после публикации?",
+    ].join("\n");
+    const keyboard = Markup.inlineKeyboard([
+      [Markup.button.callback("Да, удалить", `wk_delete_yes|${latest.queueId}|${current.rank}`)],
+      [Markup.button.callback("Нет, оставить", `wk_keep|${latest.queueId}|${current.rank}`)],
+      [Markup.button.callback("Нет, удалить", `wk_delete_no|${latest.queueId}|${current.rank}`)],
+    ]);
+    for (const chatId of chatIds) {
+      try {
+        await bot.telegram.sendMessage(chatId, text, keyboard);
+        console.info("[scheduler:reminder.sent]", { chatId, dateKey });
+      } catch (error) {
+        console.error("[scheduler:reminder.send_error]", { chatId, dateKey, error });
+      }
+    }
+  };
+
   await bot.telegram.setMyCommands([
     { command: "start", description: "Показать справку" },
     { command: "queue", description: "Показать текущую очередь постов" },
@@ -208,6 +357,7 @@ async function main(): Promise<void> {
     { command: "swapposts", description: "Поменять 2 поста местами: /swapposts 2 5" },
     { command: "queuesuggest", description: "Предложить 10 новых тем (без замены очереди)" },
     { command: "draft", description: "Сгенерировать черновик: /draft 1" },
+    { command: "scheduler_test", description: "Тест: сразу отправить драфт и напоминание" },
   ]);
 
   bot.start(async (ctx) => {
@@ -439,6 +589,22 @@ async function main(): Promise<void> {
     }
   });
 
+  bot.command("scheduler_test", async (ctx) => {
+    if (!ensureAllowed(ctx.from.id, adminIds)) {
+      await ctx.reply("Доступ запрещен.");
+      return;
+    }
+    try {
+      const dateKey = new Date().toISOString().slice(0, 10);
+      const chatIds = [ctx.chat.id];
+      await sendDraftForCurrentWeek(chatIds, dateKey);
+      await sendReminderForCurrentWeek(chatIds, dateKey);
+      await ctx.reply("scheduler_test: отправка выполнена.");
+    } catch (error) {
+      await ctx.reply(`Ошибка scheduler_test: ${(error as Error).message}`);
+    }
+  });
+
   bot.action(/^wk_(delete_yes|keep|delete_no)\|([^|]+)\|(\d+)$/, async (ctx) => {
     if (!ctx.from || !ensureAllowed(ctx.from.id, adminIds)) {
       await ctx.answerCbQuery("Доступ запрещен.");
@@ -448,10 +614,24 @@ async function main(): Promise<void> {
     const action = ctx.match[1];
     const queueId = ctx.match[2];
     const index = Number(ctx.match[3]);
+    const callbackMsg = "message" in ctx.callbackQuery ? ctx.callbackQuery.message : undefined;
+    const chatId = callbackMsg && "chat" in callbackMsg ? callbackMsg.chat.id : ctx.chat?.id;
+    const messageId = callbackMsg && "message_id" in callbackMsg ? callbackMsg.message_id : undefined;
+    const actionKey = chatId && messageId ? `${chatId}:${messageId}` : null;
+
+    if (actionKey && handledReminderMessages.has(actionKey)) {
+      await ctx.answerCbQuery("Кнопка уже использована.");
+      return;
+    }
 
     try {
+      if (actionKey) {
+        handledReminderMessages.add(actionKey);
+      }
+
       if (action === "keep") {
         await ctx.answerCbQuery("Оставили тему в очереди.");
+        await ctx.editMessageReplyMarkup(undefined).catch(() => undefined);
         await ctx.reply(`Ок, тема #${index} оставлена в очереди (queueId: ${queueId}).`);
         return;
       }
@@ -466,8 +646,12 @@ async function main(): Promise<void> {
       );
       const lines = formatQueueTopicLines(res.queue);
       await ctx.answerCbQuery("Тема удалена из очереди.");
+      await ctx.editMessageReplyMarkup(undefined).catch(() => undefined);
       await ctx.reply([`Тема #${index} удалена`, `queueId: ${res.queueId}`, "", ...lines].join("\n"));
     } catch (error) {
+      if (actionKey) {
+        handledReminderMessages.delete(actionKey);
+      }
       await ctx.answerCbQuery("Ошибка");
       await ctx.reply(`Ошибка действия по теме #${index}: ${(error as Error).message}`);
     }
@@ -526,11 +710,25 @@ async function main(): Promise<void> {
     await ctx.reply("Внутренняя ошибка бота.");
   });
 
-  await bot.launch();
+  console.info("[bot:launch.start]");
+  bot
+    .launch()
+    .then(() => {
+      console.info("[bot:launch.ok]");
+    })
+    .catch((error) => {
+      console.error("[bot:launch.error]", error);
+    });
   let lastWeeklyPublicationDate = "";
-  let lastThursdayDraftDate = "";
-  let lastSundayReminderDate = "";
-  setInterval(async () => {
+  let lastDraftSlotKey = "";
+  let lastReminderSlotKey = "";
+  let schedulerInProgress = false;
+  const runSchedulers = async (): Promise<void> => {
+    if (schedulerInProgress) {
+      console.info("[scheduler:tick_skipped]", { reason: "previous_run_in_progress" });
+      return;
+    }
+    schedulerInProgress = true;
     try {
       const now = getZonedNowParts(botTimeZone);
       if (
@@ -553,64 +751,73 @@ async function main(): Promise<void> {
       }
 
       const utc = getUtcNowParts();
-      const targets = targetChatId ? [targetChatId] : Array.from(adminIds);
+      const targets = queueTargets();
+      console.info("[scheduler:tick]", {
+        dateKey: utc.dateKey,
+        hourUtc: utc.hour,
+        minuteUtc: utc.minute,
+        targets: targets.length,
+      });
 
-      // Thursday, 09:00 UTC: send draft for current week topic.
-      if (utc.weekday === 4 && utc.hour === 9 && utc.minute === 0 && utc.dateKey !== lastThursdayDraftDate) {
-        const latest = await tryLoadLatestQueue(apiBaseUrl);
-        if (latest?.queueId && Array.isArray(latest.queue) && latest.queue.length > 0) {
-          const current = getCurrentWeekItem(latest.queue, utc.dateKey);
-          if (current) {
-            const draftRes = await apiFetch<{ status: string; draft: ApiDraft }>(apiBaseUrl, "/draft", {
-              method: "POST",
-              body: JSON.stringify({
-                queueItem: current.rank,
-                queueId: latest.queueId,
-              }),
-            });
-            const message = [
-              "Черновик на текущую неделю",
-              `Тема #${current.rank}: ${current.topic}`,
-              `Неделя: ${current.weekStart} - ${current.weekEnd}`,
-              "",
-              draftRes.draft.text,
-            ].join("\n");
-            for (const chatId of targets) {
-              await bot.telegram.sendMessage(chatId, message);
-            }
-          }
+      // Test mode: run draft scheduler every 5 minutes (UTC).
+      const draftSlotMinute = utc.minute - (utc.minute % 5);
+      const draftSlotKey = `${utc.dateKey}-${utc.hour}-${draftSlotMinute}`;
+      if (utc.minute % 5 === 0 && draftSlotKey !== lastDraftSlotKey) {
+        console.info("[scheduler:draft.trigger]", {
+          dateKey: utc.dateKey,
+          hourUtc: utc.hour,
+          minuteUtc: utc.minute,
+          slot: draftSlotKey,
+          targets: targets.length,
+        });
+        try {
+          await sendDraftForCurrentWeek(targets, utc.dateKey);
+        } catch (error) {
+          console.error("[scheduler:draft.error]", error);
         }
-        lastThursdayDraftDate = utc.dateKey;
+        lastDraftSlotKey = draftSlotKey;
       }
 
-      // Sunday, 09:00 UTC: reminder for the same week topic with 3 actions.
-      if (utc.weekday === 0 && utc.hour === 9 && utc.minute === 0 && utc.dateKey !== lastSundayReminderDate) {
-        const latest = await tryLoadLatestQueue(apiBaseUrl);
-        if (latest?.queueId && Array.isArray(latest.queue) && latest.queue.length > 0) {
-          const current = getCurrentWeekItem(latest.queue, utc.dateKey);
-          if (current) {
-            const text = [
-              "Напоминание по теме текущей недели",
-              `Тема #${current.rank}: ${current.topic}`,
-              "",
-              "Выберите действие:",
-            ].join("\n");
-            const keyboard = Markup.inlineKeyboard([
-              [Markup.button.callback("Да, удали тему из очереди", `wk_delete_yes|${latest.queueId}|${current.rank}`)],
-              [Markup.button.callback("Нет, не удаляй тему из очереди", `wk_keep|${latest.queueId}|${current.rank}`)],
-              [Markup.button.callback("Нет, удаляй тему из очереди", `wk_delete_no|${latest.queueId}|${current.rank}`)],
-            ]);
-            for (const chatId of targets) {
-              await bot.telegram.sendMessage(chatId, text, keyboard);
-            }
-          }
+      // Test mode: run reminder scheduler every 5 minutes with +2 min offset (UTC).
+      const reminderSlotMinute = utc.minute - ((utc.minute + 3) % 5);
+      const reminderSlotKey = `${utc.dateKey}-${utc.hour}-${reminderSlotMinute}`;
+      if (utc.minute % 5 === 2 && reminderSlotKey !== lastReminderSlotKey) {
+        console.info("[scheduler:reminder.trigger]", {
+          dateKey: utc.dateKey,
+          hourUtc: utc.hour,
+          minuteUtc: utc.minute,
+          slot: reminderSlotKey,
+          targets: targets.length,
+        });
+        try {
+          await sendReminderForCurrentWeek(targets, utc.dateKey);
+        } catch (error) {
+          console.error("[scheduler:reminder.error]", error);
         }
-        lastSundayReminderDate = utc.dateKey;
+        lastReminderSlotKey = reminderSlotKey;
       }
     } catch (error) {
       console.error("weekly queue publish failed", error);
+    } finally {
+      schedulerInProgress = false;
     }
-  }, 60_000);
+  };
+  const schedulerLock = await acquireSchedulerLock();
+  if (schedulerLock.acquired) {
+    console.info("[scheduler:loop.start]", { pid: process.pid, lock: "acquired" });
+    setInterval(() => {
+      void runSchedulers();
+    }, 60_000);
+    void runSchedulers();
+    process.once("SIGINT", () => {
+      void schedulerLock.release();
+    });
+    process.once("SIGTERM", () => {
+      void schedulerLock.release();
+    });
+  } else {
+    console.warn("[scheduler:disabled]", { reason: "lock_not_acquired", pid: process.pid });
+  }
 
   console.log("bot service started", {
     apiBaseUrl,
