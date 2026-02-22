@@ -25,18 +25,16 @@ npm run dev:bot:env
 ```
 
 ## API (current)
-- `GET /queue/next10` -> generate queue for next 10 weeks
+- `GET /queue/suggest10` -> suggest 10 new topics (without replacing saved queue)
+- `GET /queue/next10` -> generate and save queue for next 10 weeks
 - `GET /queue/latest` -> get latest saved queue
 - `POST /queue/replace` -> replace all 10 topics
 - `POST /queue/swap` -> swap two queue positions
 - `POST /draft` -> generate draft by `queueItem` (1..10) or by `topic`
 
-Backward-compatible aliases:
-- `GET /plan/next10` -> alias to `/queue/next10`
-- `GET /plan/latest` -> alias to `/queue/latest`
-
 ### Example requests
 ```bash
+curl http://localhost:3000/queue/suggest10
 curl http://localhost:3000/queue/next10
 curl http://localhost:3000/queue/latest
 curl -X POST http://localhost:3000/queue/swap \
@@ -48,15 +46,11 @@ curl -X POST http://localhost:3000/draft \
 ```
 
 ## Bot Commands
-- `/queue10` -> generate queue for 10 weeks
-- `/queuelatest` -> show latest queue
+- `/queuesuggest` -> suggest 10 new topics (queue is not replaced)
+- `/queue` -> show latest queue
 - `/draft <1..10>` -> generate draft for queue item
 - `/replaceposts` -> enter mode to send 10 topics (one message)
 - `/swapposts <from> <to>` -> swap queue items
-
-Aliases:
-- `/plan10` -> `/queue10`
-- `/planlatest` -> `/queuelatest`
 
 ## Weekly Auto-Publish
 Bot auto-sends a new 10-week queue every Sunday.

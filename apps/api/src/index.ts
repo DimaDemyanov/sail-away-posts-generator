@@ -107,6 +107,26 @@ async function generateAndSaveQueue(indexedPosts: IndexedPost[], config: ReturnT
   };
 }
 
+async function generateSuggestedQueue(indexedPosts: IndexedPost[], config: ReturnType<typeof loadConfig>) {
+  const latest = await loadLatestPlan();
+  const avoidTopics = Array.isArray(latest?.queue) ? latest.queue.map((item) => item.topic) : [];
+
+  const ragResult = await buildNext10PlanRag(indexedPosts, {
+    apiKey: config.openaiApiKey,
+    model: config.openaiModel,
+    embeddingModel: config.openaiEmbeddingModel,
+    topK: config.ragTopK,
+    avoidTopics,
+  });
+
+  return {
+    status: "ok" as const,
+    mode: "rag" as const,
+    topicSeeds: ragResult.topicSeeds,
+    queue: withWeeklySlots(ragResult.plan),
+  };
+}
+
 async function main(): Promise<void> {
   const config = loadConfig();
   const app = Fastify({ logger: true });
@@ -128,6 +148,26 @@ async function main(): Promise<void> {
       model: config.openaiModel,
       embeddingModel: config.openaiEmbeddingModel,
     };
+  });
+
+  app.get("/queue/suggest10", async (_request, reply) => {
+    if (indexedPosts.length === 0) {
+      return reply.code(400).send({
+        status: "error",
+        message: "History is empty after startup indexing.",
+      });
+    }
+
+    try {
+      return await generateSuggestedQueue(indexedPosts, config);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "rag_generation_failed";
+      app.log.error({ err: error }, "RAG suggestion generation failed");
+      return reply.code(502).send({
+        status: "error",
+        message: `RAG generation failed: ${message}`,
+      });
+    }
   });
 
   app.get("/queue/next10", async (_request, reply) => {
@@ -315,21 +355,6 @@ async function main(): Promise<void> {
       queueId: resolvedQueueId,
       draft,
     };
-  });
-
-  // Backward-compatible aliases
-  app.get("/plan/next10", async (_request, reply) => {
-    return app.inject({ method: "GET", url: "/queue/next10" }).then((res) => {
-      reply.code(res.statusCode).headers(res.headers);
-      return res.json();
-    });
-  });
-
-  app.get("/plan/latest", async (_request, reply) => {
-    return app.inject({ method: "GET", url: "/queue/latest" }).then((res) => {
-      reply.code(res.statusCode).headers(res.headers);
-      return res.json();
-    });
   });
 
   await app.listen({ host: "0.0.0.0", port: config.apiPort });

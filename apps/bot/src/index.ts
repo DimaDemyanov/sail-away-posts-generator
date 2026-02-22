@@ -131,13 +131,11 @@ async function main(): Promise<void> {
 
   await bot.telegram.setMyCommands([
     { command: "start", description: "Показать справку" },
-    { command: "queue10", description: "Сгенерировать очередь из 10 постов" },
-    { command: "queuelatest", description: "Показать последнюю сохраненную очередь" },
+    { command: "queuesuggest", description: "Предложить 10 новых тем (без замены очереди)" },
+    { command: "queue", description: "Показать последнюю сохраненную очередь" },
     { command: "draft", description: "Сгенерировать драфт: /draft 1" },
     { command: "replaceposts", description: "Заменить все 10 тем очереди" },
     { command: "swapposts", description: "Поменять 2 поста местами: /swapposts 2 5" },
-    { command: "plan10", description: "Алиас /queue10" },
-    { command: "planlatest", description: "Алиас /queuelatest" },
   ]);
 
   bot.start(async (ctx) => {
@@ -150,8 +148,8 @@ async function main(): Promise<void> {
         "Sail Away Bot",
         "",
         "Команды:",
-        "/queue10",
-        "/queuelatest",
+        "/queuesuggest",
+        "/queue",
         "/draft <номер_поста_1_до_10>",
         "/replaceposts",
         "/swapposts <from> <to>",
@@ -165,24 +163,25 @@ async function main(): Promise<void> {
       return;
     }
     try {
-      const res = await apiFetch<ApiQueueResponse>(apiBaseUrl, "/queue/next10");
+      const res = await apiFetch<ApiQueueResponse>(apiBaseUrl, "/queue/suggest10");
       if (!Array.isArray(res.queue)) {
         await ctx.reply(
-          `Ошибка queue10: некорректный формат ответа API (queue не массив). payload=${JSON.stringify(res).slice(0, 300)}`,
+          `Ошибка queuesuggest: некорректный формат ответа API (queue не массив). payload=${JSON.stringify(res).slice(0, 300)}`,
         );
         return;
       }
 
       const lines = formatQueueLines(res.queue as ApiQueueItem[]);
       await ctx.reply(
-        [`Очередь создана (${res.mode ?? "unknown"})`, `queueId: ${res.queueId ?? "n/a"}`, "", ...lines].join("\n\n"),
+        [`Предложено 10 новых тем (${res.mode ?? "unknown"})`, "Текущая очередь не изменена.", "", ...lines].join(
+          "\n\n",
+        ),
       );
     } catch (error) {
-      await ctx.reply(`Ошибка queue10: ${(error as Error).message}`);
+      await ctx.reply(`Ошибка queuesuggest: ${(error as Error).message}`);
     }
   };
-  bot.command("queue10", async (ctx) => handleQueue10(ctx));
-  bot.command("plan10", async (ctx) => handleQueue10(ctx));
+  bot.command("queuesuggest", async (ctx) => handleQueue10(ctx));
 
   const handleQueueLatest = async (ctx: { from: { id: number }; reply: (text: string) => Promise<unknown> }) => {
     if (!ensureAllowed(ctx.from.id, adminIds)) {
@@ -192,18 +191,17 @@ async function main(): Promise<void> {
     try {
       const latest = await apiFetch<ApiLatestQueue>(apiBaseUrl, "/queue/latest");
       if (!latest.queueId || !Array.isArray(latest.queue)) {
-        await ctx.reply("Нет сохраненной очереди. Сначала вызовите /queue10");
+        await ctx.reply("Нет сохраненной очереди. Сначала вызовите /queuesuggest");
         return;
       }
 
       const lines = formatQueueLines(latest.queue);
       await ctx.reply([`Последняя очередь`, `queueId: ${latest.queueId}`, "", ...lines].join("\n\n"));
     } catch (error) {
-      await ctx.reply(`Ошибка queuelatest: ${(error as Error).message}`);
+      await ctx.reply(`Ошибка queue: ${(error as Error).message}`);
     }
   };
-  bot.command("queuelatest", async (ctx) => handleQueueLatest(ctx));
-  bot.command("planlatest", async (ctx) => handleQueueLatest(ctx));
+  bot.command("queue", async (ctx) => handleQueueLatest(ctx));
 
   bot.command("draft", async (ctx) => {
     if (!ensureAllowed(ctx.from.id, adminIds)) {
@@ -221,7 +219,7 @@ async function main(): Promise<void> {
     try {
       const latest = await apiFetch<ApiLatestQueue>(apiBaseUrl, "/queue/latest");
       if (!latest.queueId) {
-        await ctx.reply("Нет сохраненной очереди. Сначала вызовите /queue10");
+        await ctx.reply("Нет сохраненной очереди. Сначала вызовите /queuesuggest");
         return;
       }
 
