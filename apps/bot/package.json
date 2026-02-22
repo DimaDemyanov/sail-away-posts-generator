@@ -11,6 +11,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@sail-away/core": "*"
+    "@sail-away/core": "*",
+    "telegraf": "^4.16.3"
   }
 }

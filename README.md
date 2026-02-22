@@ -33,6 +33,24 @@ curl -X POST http://localhost:3000/draft \
   -d '{"planItem":1,"planId":"<planId-from-plan-next10>"}'
 ```
 
+## Telegram Bot MVP
+Required env vars:
+```bash
+TELEGRAM_BOT_TOKEN=...
+ADMIN_TELEGRAM_IDS=123456789,987654321
+API_BASE_URL=http://localhost:3000
+```
+
+Run:
+```bash
+npm run dev:bot
+```
+
+Commands:
+- `/reindex`
+- `/plan10`
+- `/draft <1..10>`
+
 Lightweight project for generating "Sail Away" themed social media posts.
 
 ## Features
