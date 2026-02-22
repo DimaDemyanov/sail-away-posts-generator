@@ -6,3 +6,4 @@ coverage/
 .turbo/
 *.log
 .npm-cache/
+data/

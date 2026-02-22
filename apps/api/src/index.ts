@@ -8,10 +8,12 @@ import {
   loadHistoryFromDir,
   type IndexedPost,
 } from "@sail-away/core";
+import { createPlanId, loadLatestPlan, saveLatestPlan } from "./planStore";
 
 interface DraftRequestBody {
   topic?: string;
   planItem?: number;
+  planId?: string;
 }
 
 async function main(): Promise<void> {
@@ -60,11 +62,40 @@ async function main(): Promise<void> {
           topK: config.ragTopK,
         })
       : buildNext10Plan(indexedPosts);
-    return {
-      status: "ok",
-      mode: config.openaiApiKey ? "rag" : "heuristic",
+    const mode: "rag" | "heuristic" = config.openaiApiKey ? "rag" : "heuristic";
+    const planId = createPlanId();
+    const createdAt = new Date().toISOString();
+
+    await saveLatestPlan({
+      planId,
+      createdAt,
+      mode,
       totalPosts: indexedPosts.length,
       plan,
+    });
+
+    return {
+      status: "ok",
+      mode,
+      planId,
+      createdAt,
+      totalPosts: indexedPosts.length,
+      plan,
+    };
+  });
+
+  app.get("/plan/latest", async (_request, reply) => {
+    const latest = await loadLatestPlan();
+    if (!latest) {
+      return reply.code(404).send({
+        status: "error",
+        message: "No saved plan found. Call GET /plan/next10 first.",
+      });
+    }
+
+    return {
+      status: "ok",
+      ...latest,
     };
   });
 
@@ -77,8 +108,10 @@ async function main(): Promise<void> {
     }
 
     const planItem = request.body?.planItem;
+    const planId = request.body?.planId?.trim();
     const directTopic = request.body?.topic?.trim();
     let topic = directTopic;
+    let resolvedPlanId: string | undefined;
 
     if (!topic && typeof planItem === "number") {
       if (planItem < 1 || planItem > 10) {
@@ -87,8 +120,24 @@ async function main(): Promise<void> {
           message: "planItem must be between 1 and 10",
         });
       }
-      const plan = buildNext10Plan(indexedPosts);
-      topic = plan[planItem - 1]?.topic;
+
+      const latest = await loadLatestPlan();
+      if (!latest) {
+        return reply.code(400).send({
+          status: "error",
+          message: "No saved plan found. Call GET /plan/next10 first.",
+        });
+      }
+
+      if (planId && latest.planId !== planId) {
+        return reply.code(400).send({
+          status: "error",
+          message: "Requested planId does not match latest saved plan.",
+        });
+      }
+
+      topic = latest.plan[planItem - 1]?.topic;
+      resolvedPlanId = latest.planId;
     }
 
     if (!topic) {
@@ -107,6 +156,7 @@ async function main(): Promise<void> {
 
     return {
       status: "ok",
+      planId: resolvedPlanId,
       draft,
     };
   });

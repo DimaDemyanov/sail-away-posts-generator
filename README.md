@@ -16,7 +16,8 @@ npm run dev:api
 Then:
 1. `POST /reindex` to load JSON history from `./history`
 2. `GET /plan/next10` to get the first 10-post plan
-3. `POST /draft` to generate post text + image options
+3. `GET /plan/latest` to get the last saved plan
+4. `POST /draft` to generate post text + image options
 
 `GET /plan/next10` works in two modes:
 - `rag` (when `OPENAI_API_KEY` is set)
@@ -26,9 +27,10 @@ Example:
 ```bash
 curl -X POST http://localhost:3000/reindex
 curl http://localhost:3000/plan/next10
+curl http://localhost:3000/plan/latest
 curl -X POST http://localhost:3000/draft \
   -H "content-type: application/json" \
-  -d '{"planItem":1}'
+  -d '{"planItem":1,"planId":"<planId-from-plan-next10>"}'
 ```
 
 Lightweight project for generating "Sail Away" themed social media posts.
