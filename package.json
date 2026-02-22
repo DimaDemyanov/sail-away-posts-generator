@@ -15,13 +15,16 @@
     "test": "npm run -ws test --if-present",
     "dev:api": "npm run -w @sail-away/api dev",
     "dev:worker": "npm run -w @sail-away/worker dev",
-    "dev:bot": "npm run -w @sail-away/bot dev"
+    "dev:bot": "npm run -w @sail-away/bot dev",
+    "dev:api:env": "dotenv -e .env -- npm run dev:api",
+    "dev:bot:env": "dotenv -e .env -- npm run dev:bot"
   },
   "engines": {
     "node": ">=20"
   },
   "devDependencies": {
     "@types/node": "^24.3.0",
+    "dotenv-cli": "^7.4.2",
     "tsx": "^4.20.4",
     "typescript": "^5.9.2"
   }
