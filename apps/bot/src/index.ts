@@ -29,6 +29,12 @@ interface ApiLatestQueue {
   message?: string;
 }
 
+interface ApiQueueCreateResponse {
+  status: string;
+  queueId?: string;
+  queue?: ApiQueueItem[];
+}
+
 function getEnv(name: string): string {
   const value = process.env[name]?.trim();
   if (!value) {
@@ -74,6 +80,18 @@ async function apiFetch<T>(baseUrl: string, path: string, init?: RequestInit): P
   return body as T;
 }
 
+async function tryLoadLatestQueue(baseUrl: string): Promise<ApiLatestQueue | null> {
+  try {
+    const latest = await apiFetch<ApiLatestQueue>(baseUrl, "/queue/latest");
+    if (!latest.queueId || !Array.isArray(latest.queue)) {
+      return null;
+    }
+    return latest;
+  } catch {
+    return null;
+  }
+}
+
 function ensureAllowed(userId: number, adminIds: Set<number>): boolean {
   return adminIds.has(userId);
 }
@@ -86,7 +104,11 @@ function parseTopicsText(raw: string): string[] {
   return lines.map((line) => line.replace(/^\d+\.\s*/, "").trim()).filter(Boolean);
 }
 
-function formatQueueLines(queue: ApiQueueItem[]): string[] {
+function formatQueueTopicLines(queue: ApiQueueItem[]): string[] {
+  return queue.map((item) => `${item.rank}. ${item.topic}`);
+}
+
+function formatQueueScheduleLines(queue: ApiQueueItem[]): string[] {
   return queue.map((item) => `${item.rank}. ${item.topic}\nНеделя: ${item.weekStart} - ${item.weekEnd}`);
 }
 
@@ -128,14 +150,44 @@ async function main(): Promise<void> {
 
   const bot = new Telegraf(botToken);
   const replaceModeUsers = new Set<number>();
+  const addTopicModeUsers = new Set<number>();
+
+  const appendTopic = async (
+    userId: number,
+    topic: string,
+    reply: (text: string) => Promise<unknown>,
+  ): Promise<void> => {
+    const cleanTopic = topic.trim();
+    if (!cleanTopic) {
+      await reply("Тема не должна быть пустой.");
+      return;
+    }
+
+    const latest = await tryLoadLatestQueue(apiBaseUrl);
+    const topics = latest ? latest.queue?.map((item) => item.topic) ?? [] : [];
+    topics.push(cleanTopic);
+    const res = await apiFetch<{ status: string; queueId: string; queue: ApiQueueItem[] }>(
+      apiBaseUrl,
+      "/queue/replace",
+      {
+        method: "POST",
+        body: JSON.stringify({ topics }),
+      },
+    );
+    addTopicModeUsers.delete(userId);
+    const lines = formatQueueTopicLines(res.queue);
+    await reply([`Тема добавлена`, `queueId: ${res.queueId}`, "", ...lines].join("\n"));
+  };
 
   await bot.telegram.setMyCommands([
     { command: "start", description: "Показать справку" },
-    { command: "queuesuggest", description: "Предложить 10 новых тем (без замены очереди)" },
-    { command: "queue", description: "Показать последнюю сохраненную очередь" },
-    { command: "draft", description: "Сгенерировать драфт: /draft 1" },
-    { command: "replaceposts", description: "Заменить все 10 тем очереди" },
+    { command: "queue", description: "Показать текущую очередь постов" },
+    { command: "schedule", description: "Показать расписание (с датами)" },
+    { command: "draft", description: "Сгенерировать черновик: /draft 1" },
+    { command: "replaceposts", description: "Обновить список тем (любое количество)" },
+    { command: "addtopic", description: "Добавить тему в конец списка" },
     { command: "swapposts", description: "Поменять 2 поста местами: /swapposts 2 5" },
+    { command: "queuesuggest", description: "Предложить 10 новых тем (без замены очереди)" },
   ]);
 
   bot.start(async (ctx) => {
@@ -148,11 +200,13 @@ async function main(): Promise<void> {
         "Sail Away Bot",
         "",
         "Команды:",
-        "/queuesuggest",
         "/queue",
-        "/draft <номер_поста_1_до_10>",
+        "/schedule",
+        "/draft <номер_поста>",
         "/replaceposts",
+        "/addtopic <тема>",
         "/swapposts <from> <to>",
+        "/queuesuggest",
       ].join("\n"),
     );
   });
@@ -171,11 +225,9 @@ async function main(): Promise<void> {
         return;
       }
 
-      const lines = formatQueueLines(res.queue as ApiQueueItem[]);
+      const lines = formatQueueTopicLines(res.queue as ApiQueueItem[]);
       await ctx.reply(
-        [`Предложено 10 новых тем (${res.mode ?? "unknown"})`, "Текущая очередь не изменена.", "", ...lines].join(
-          "\n\n",
-        ),
+        [`Предложено 10 новых тем (${res.mode ?? "unknown"})`, "Текущая очередь не изменена.", "", ...lines].join("\n"),
       );
     } catch (error) {
       await ctx.reply(`Ошибка queuesuggest: ${(error as Error).message}`);
@@ -189,19 +241,49 @@ async function main(): Promise<void> {
       return;
     }
     try {
+      let latest = await tryLoadLatestQueue(apiBaseUrl);
+      if (!latest) {
+        const created = await apiFetch<ApiQueueCreateResponse>(apiBaseUrl, "/queue/init-empty", {
+          method: "POST",
+        });
+        if (!created.queueId || !Array.isArray(created.queue)) {
+          await ctx.reply("Не удалось создать текущую очередь.");
+          return;
+        }
+        latest = {
+          status: "ok",
+          queueId: created.queueId,
+          queue: created.queue,
+        };
+        await ctx.reply("Очередь была пустой, создала пустую очередь.");
+      }
+
+      const lines = formatQueueTopicLines(latest.queue ?? []);
+      await ctx.reply([`Текущая очередь постов`, `queueId: ${latest.queueId}`, "", ...lines].join("\n"));
+    } catch (error) {
+      await ctx.reply(`Ошибка queue: ${(error as Error).message}`);
+    }
+  };
+  bot.command("queue", async (ctx) => handleQueueLatest(ctx));
+
+  bot.command("schedule", async (ctx) => {
+    if (!ensureAllowed(ctx.from.id, adminIds)) {
+      await ctx.reply("Доступ запрещен.");
+      return;
+    }
+    try {
       const latest = await apiFetch<ApiLatestQueue>(apiBaseUrl, "/queue/latest");
       if (!latest.queueId || !Array.isArray(latest.queue)) {
         await ctx.reply("Нет сохраненной очереди. Сначала вызовите /queuesuggest");
         return;
       }
 
-      const lines = formatQueueLines(latest.queue);
-      await ctx.reply([`Последняя очередь`, `queueId: ${latest.queueId}`, "", ...lines].join("\n\n"));
+      const lines = formatQueueScheduleLines(latest.queue);
+      await ctx.reply([`Расписание`, `queueId: ${latest.queueId}`, "", ...lines].join("\n\n"));
     } catch (error) {
-      await ctx.reply(`Ошибка queue: ${(error as Error).message}`);
+      await ctx.reply(`Ошибка schedule: ${(error as Error).message}`);
     }
-  };
-  bot.command("queue", async (ctx) => handleQueueLatest(ctx));
+  });
 
   bot.command("draft", async (ctx) => {
     if (!ensureAllowed(ctx.from.id, adminIds)) {
@@ -211,15 +293,19 @@ async function main(): Promise<void> {
 
     const arg = ctx.message.text.split(" ").slice(1).join(" ").trim();
     const planItem = Number(arg);
-    if (!Number.isFinite(planItem) || planItem < 1 || planItem > 10) {
-      await ctx.reply("Использование: /draft <номер_от_1_до_10>");
+    if (!Number.isFinite(planItem) || planItem < 1) {
+      await ctx.reply("Использование: /draft <номер_поста>");
       return;
     }
 
     try {
       const latest = await apiFetch<ApiLatestQueue>(apiBaseUrl, "/queue/latest");
-      if (!latest.queueId) {
+      if (!latest.queueId || !Array.isArray(latest.queue)) {
         await ctx.reply("Нет сохраненной очереди. Сначала вызовите /queuesuggest");
+        return;
+      }
+      if (planItem > latest.queue.length) {
+        await ctx.reply(`Номер поста вне диапазона: 1..${latest.queue.length}`);
         return;
       }
 
@@ -255,9 +341,27 @@ async function main(): Promise<void> {
     }
     replaceModeUsers.add(ctx.from.id);
     await ctx.reply(
-      "Отправьте 10 тем сообщением (каждая с новой строки). Можно в формате `1. Тема` ... `10. Тема`.",
+      "Отправьте список тем сообщением (каждая с новой строки, любое количество). Можно в формате `1. Тема`.",
       { parse_mode: "Markdown" },
     );
+  });
+
+  bot.command("addtopic", async (ctx) => {
+    if (!ensureAllowed(ctx.from.id, adminIds)) {
+      await ctx.reply("Доступ запрещен.");
+      return;
+    }
+    const topicFromArgs = ctx.message.text.split(" ").slice(1).join(" ").trim();
+    if (topicFromArgs) {
+      try {
+        await appendTopic(ctx.from.id, topicFromArgs, (text) => ctx.reply(text));
+      } catch (error) {
+        await ctx.reply(`Ошибка addtopic: ${(error as Error).message}`);
+      }
+      return;
+    }
+    addTopicModeUsers.add(ctx.from.id);
+    await ctx.reply("Пришлите тему одним сообщением, я добавлю ее в конец текущей очереди.");
   });
 
   bot.command("swapposts", async (ctx) => {
@@ -270,7 +374,7 @@ async function main(): Promise<void> {
     const from = args[0];
     const to = args[1];
     if (!Number.isFinite(from) || !Number.isFinite(to)) {
-      await ctx.reply("Использование: /swapposts <from_1_до_10> <to_1_до_10>");
+      await ctx.reply("Использование: /swapposts <from> <to>");
       return;
     }
 
@@ -279,8 +383,8 @@ async function main(): Promise<void> {
         method: "POST",
         body: JSON.stringify({ from, to }),
       });
-      const lines = formatQueueLines(res.queue);
-      await ctx.reply([`Очередь обновлена`, "", ...lines].join("\n\n"));
+      const lines = formatQueueTopicLines(res.queue);
+      await ctx.reply([`Очередь обновлена`, "", ...lines].join("\n"));
     } catch (error) {
       await ctx.reply(`Ошибка swapposts: ${(error as Error).message}`);
     }
@@ -289,6 +393,18 @@ async function main(): Promise<void> {
   bot.on("text", async (ctx, next) => {
     if (!ensureAllowed(ctx.from.id, adminIds)) {
       return next();
+    }
+
+    if (addTopicModeUsers.has(ctx.from.id)) {
+      if (ctx.message.text.startsWith("/")) {
+        return next();
+      }
+      try {
+        await appendTopic(ctx.from.id, ctx.message.text, (text) => ctx.reply(text));
+      } catch (error) {
+        await ctx.reply(`Ошибка addtopic: ${(error as Error).message}`);
+      }
+      return;
     }
 
     if (!replaceModeUsers.has(ctx.from.id)) {
@@ -300,8 +416,8 @@ async function main(): Promise<void> {
     }
 
     const topics = parseTopicsText(ctx.message.text);
-    if (topics.length !== 10) {
-      await ctx.reply(`Нужно ровно 10 тем. Сейчас: ${topics.length}. Отправьте заново.`);
+    if (topics.length < 1) {
+      await ctx.reply("Нужна минимум 1 тема. Отправьте заново.");
       return;
     }
 
@@ -315,8 +431,8 @@ async function main(): Promise<void> {
         },
       );
       replaceModeUsers.delete(ctx.from.id);
-      const lines = formatQueueLines(res.queue);
-      await ctx.reply([`Очередь заменена`, `queueId: ${res.queueId}`, "", ...lines].join("\n\n"));
+      const lines = formatQueueTopicLines(res.queue);
+      await ctx.reply([`Список тем обновлен`, `queueId: ${res.queueId}`, "", ...lines].join("\n"));
     } catch (error) {
       await ctx.reply(`Ошибка replaceposts: ${(error as Error).message}`);
     }
@@ -340,7 +456,7 @@ async function main(): Promise<void> {
       ) {
         const res = await apiFetch<ApiQueueResponse>(apiBaseUrl, "/queue/next10");
         if (!Array.isArray(res.queue)) return;
-        const lines = formatQueueLines(res.queue as ApiQueueItem[]);
+        const lines = formatQueueScheduleLines(res.queue as ApiQueueItem[]);
         const message = [`Еженедельная очередь на 10 недель`, `queueId: ${res.queueId ?? "n/a"}`, "", ...lines].join(
           "\n\n",
         );

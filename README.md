@@ -47,9 +47,11 @@ curl -X POST http://localhost:3000/draft \
 
 ## Bot Commands
 - `/queuesuggest` -> suggest 10 new topics (queue is not replaced)
-- `/queue` -> show latest queue
-- `/draft <1..10>` -> generate draft for queue item
-- `/replaceposts` -> enter mode to send 10 topics (one message)
+- `/queue` -> show current posts queue (without dates)
+- `/schedule` -> show queue schedule with week dates
+- `/draft <index>` -> generate draft for queue item
+- `/replaceposts` -> update topics list with any number of topics
+- `/addtopic <тема>` -> add one topic to the end of queue
 - `/swapposts <from> <to>` -> swap queue items
 
 ## Weekly Auto-Publish

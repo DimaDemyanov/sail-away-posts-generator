@@ -72,6 +72,22 @@ function parseTopicsText(raw: string): string[] {
   return lines.map((line) => line.replace(/^\d+\.\s*/, "").trim()).filter(Boolean);
 }
 
+function buildQueueFromTopics(topics: string[], baseQueue: QueueItem[]): QueueItem[] {
+  const fallback = baseQueue[0];
+  const planItems: PlanItem[] = topics.map((topic, index) => {
+    const source = baseQueue[index] ?? fallback;
+    return {
+      rank: index + 1,
+      topic,
+      objective: source?.objective ?? "engagement",
+      tone: source?.tone ?? "casual",
+      cta: source?.cta ?? "Поделитесь вашим опытом в комментариях",
+      sourcePostIds: Array.isArray(source?.sourcePostIds) ? source.sourcePostIds : [],
+    };
+  });
+  return withWeeklySlots(planItems);
+}
+
 async function generateAndSaveQueue(indexedPosts: IndexedPost[], config: ReturnType<typeof loadConfig>) {
   const latest = await loadLatestPlan();
   const avoidTopics = Array.isArray(latest?.queue) ? latest.queue.map((item) => item.topic) : [];
@@ -205,39 +221,66 @@ async function main(): Promise<void> {
     };
   });
 
-  app.post<{ Body: ReplaceQueueBody }>("/queue/replace", async (request, reply) => {
+  app.post("/queue/init-empty", async () => {
     const latest = await loadLatestPlan();
-    if (!latest) {
-      return reply.code(404).send({
-        status: "error",
-        message: "No saved queue found. Call GET /queue/next10 first.",
-      });
+    if (latest) {
+      return {
+        status: "ok",
+        ...latest,
+      };
     }
 
+    const queueId = createPlanId();
+    const createdAt = new Date().toISOString();
+    const queue: QueueItem[] = [];
+    await saveLatestPlan({
+      queueId,
+      createdAt,
+      mode: "rag",
+      totalPosts: indexedPosts.length,
+      queue,
+    });
+
+    return {
+      status: "ok",
+      queueId,
+      createdAt,
+      mode: "rag" as const,
+      totalPosts: indexedPosts.length,
+      queue,
+    };
+  });
+
+  app.post<{ Body: ReplaceQueueBody }>("/queue/replace", async (request, reply) => {
     const fromText = request.body?.topicsText?.trim();
     const fromArray = Array.isArray(request.body?.topics)
       ? request.body?.topics.map((t) => String(t).trim()).filter(Boolean)
       : [];
     const topics = fromText ? parseTopicsText(fromText) : fromArray;
 
-    if (topics.length !== 10) {
+    if (topics.length < 1) {
       return reply.code(400).send({
         status: "error",
-        message: "Provide exactly 10 topics.",
+        message: "Provide at least 1 topic.",
       });
     }
 
-    const queue = latest.queue.map((item, index) => ({
-      ...item,
-      rank: index + 1,
-      weekIndex: index + 1,
-      topic: topics[index] ?? item.topic,
-    }));
-    await saveLatestPlan({ ...latest, queue });
+    const latest = await loadLatestPlan();
+    const queue = buildQueueFromTopics(topics, latest?.queue ?? []);
+    const queueId = latest?.queueId ?? createPlanId();
+    const createdAt = latest?.createdAt ?? new Date().toISOString();
+    const totalPosts = latest?.totalPosts ?? indexedPosts.length;
+    await saveLatestPlan({
+      queueId,
+      createdAt,
+      mode: "rag",
+      totalPosts,
+      queue,
+    });
 
     return {
       status: "ok",
-      queueId: latest.queueId,
+      queueId,
       queue,
     };
   });
@@ -253,17 +296,24 @@ async function main(): Promise<void> {
 
     const from = request.body?.from;
     const to = request.body?.to;
+    const maxPosition = latest.queue.length;
+    if (maxPosition < 2) {
+      return reply.code(400).send({
+        status: "error",
+        message: "Need at least 2 items in queue to swap.",
+      });
+    }
     if (
       typeof from !== "number" ||
       typeof to !== "number" ||
       from < 1 ||
-      from > 10 ||
+      from > maxPosition ||
       to < 1 ||
-      to > 10
+      to > maxPosition
     ) {
       return reply.code(400).send({
         status: "error",
-        message: "from and to must be numbers in range 1..10",
+        message: `from and to must be numbers in range 1..${maxPosition}`,
       });
     }
 
@@ -300,10 +350,10 @@ async function main(): Promise<void> {
     let resolvedQueueId: string | undefined;
 
     if (!topic && typeof queueItem === "number") {
-      if (queueItem < 1 || queueItem > 10) {
+      if (queueItem < 1) {
         return reply.code(400).send({
           status: "error",
-          message: "queueItem must be between 1 and 10",
+          message: "queueItem must be greater than 0",
         });
       }
 
@@ -312,6 +362,13 @@ async function main(): Promise<void> {
         return reply.code(400).send({
           status: "error",
           message: "No saved queue found. Call GET /queue/next10 first.",
+        });
+      }
+      const maxQueueItem = latest.queue.length;
+      if (queueItem > maxQueueItem) {
+        return reply.code(400).send({
+          status: "error",
+          message: `queueItem must be in range 1..${maxQueueItem}`,
         });
       }
 
