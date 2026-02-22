@@ -17,6 +17,10 @@ Then:
 1. `POST /reindex` to load JSON history from `./history`
 2. `GET /plan/next10` to get the first 10-post plan
 
+`GET /plan/next10` works in two modes:
+- `rag` (when `OPENAI_API_KEY` is set)
+- `heuristic` (fallback when API key is not set)
+
 Example:
 ```bash
 curl -X POST http://localhost:3000/reindex

@@ -2,6 +2,7 @@ import Fastify from "fastify";
 import path from "node:path";
 import {
   buildNext10Plan,
+  buildNext10PlanRag,
   loadConfig,
   loadHistoryFromDir,
   type IndexedPost,
@@ -45,9 +46,17 @@ async function main(): Promise<void> {
         message: "No indexed history. Call POST /reindex first.",
       });
     }
-    const plan = buildNext10Plan(indexedPosts);
+    const plan = config.openaiApiKey
+      ? await buildNext10PlanRag(indexedPosts, {
+          apiKey: config.openaiApiKey,
+          model: config.openaiModel,
+          embeddingModel: config.openaiEmbeddingModel,
+          topK: config.ragTopK,
+        })
+      : buildNext10Plan(indexedPosts);
     return {
       status: "ok",
+      mode: config.openaiApiKey ? "rag" : "heuristic",
       totalPosts: indexedPosts.length,
       plan,
     };

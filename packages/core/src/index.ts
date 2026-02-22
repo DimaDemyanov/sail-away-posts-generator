@@ -12,3 +12,4 @@ export {
   type IndexedPost,
 } from "./history";
 export { buildNext10Plan, type PlanItem } from "./planner";
+export { buildNext10PlanRag } from "./rag";

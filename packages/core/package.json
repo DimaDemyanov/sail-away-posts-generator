@@ -9,5 +9,8 @@
     "lint": "echo \"lint not configured yet\"",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node --import tsx --test test/**/*.test.ts"
+  },
+  "dependencies": {
+    "openai": "^5.22.0"
   }
 }
