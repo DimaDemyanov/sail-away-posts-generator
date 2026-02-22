@@ -33,7 +33,7 @@ async function main(): Promise<void> {
       app.log.error(error);
       return reply.code(500).send({
         status: "error",
-        message: "Failed to index history files from ./history",
+        message: "Не удалось обработать файлы истории из ./history",
       });
     }
   });

@@ -10,16 +10,16 @@ export interface PlanItem {
 }
 
 const DEFAULT_TOPICS = [
-  "Route story from last voyage",
-  "Seamanship tip from real conditions",
-  "Harbor spotlight and what to expect",
-  "Crew life behind the scenes",
-  "Weather window decision breakdown",
-  "Navigation lesson with chart context",
-  "Boat maintenance reality check",
-  "Favorite anchorage photo story",
-  "Provisioning strategy on a budget",
-  "Q&A post for follower questions",
+  "История маршрута из последнего путешествия",
+  "Практический совет по управлению яхтой в реальных условиях",
+  "Обзор марины: что важно знать перед заходом",
+  "Жизнь экипажа за кадром",
+  "Разбор погодного окна и решения по выходу",
+  "Урок навигации на примере реального перехода",
+  "Проверка и обслуживание лодки перед выходом",
+  "Фотоистория о любимой якорной стоянке",
+  "Как мы планируем провизию и бюджет в походе",
+  "Пост с ответами на вопросы подписчиков",
 ];
 
 function pickObjective(rank: number): PlanItem["objective"] {
@@ -49,7 +49,10 @@ export function buildNext10Plan(posts: IndexedPost[]): PlanItem[] {
       topic,
       objective: pickObjective(rank),
       tone: pickTone(rank),
-      cta: rank % 2 === 0 ? "Share your experience in comments" : "Follow for the next sailing update",
+      cta:
+        rank % 2 === 0
+          ? "Поделитесь своим опытом в комментариях"
+          : "Подписывайтесь, чтобы не пропустить следующий пост",
       sourcePostIds: sourceSlice.map((p) => p.id),
     };
   });
