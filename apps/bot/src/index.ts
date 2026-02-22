@@ -69,6 +69,11 @@ async function main(): Promise<void> {
   const adminIds = parseAdminIds(getEnv("ADMIN_TELEGRAM_IDS"));
 
   const bot = new Telegraf(botToken);
+  await bot.telegram.setMyCommands([
+    { command: "start", description: "Показать справку" },
+    { command: "plan10", description: "Сгенерировать план из 10 постов" },
+    { command: "draft", description: "Сгенерировать драфт: /draft 1" },
+  ]);
 
   bot.start(async (ctx) => {
     if (!ensureAllowed(ctx.from.id, adminIds)) {
