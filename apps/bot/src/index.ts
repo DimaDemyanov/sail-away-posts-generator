@@ -42,10 +42,11 @@ function parseAdminIds(raw: string): Set<number> {
 }
 
 async function apiFetch<T>(baseUrl: string, path: string, init?: RequestInit): Promise<T> {
+  const hasBody = init?.body !== undefined && init?.body !== null;
   const res = await fetch(`${baseUrl}${path}`, {
     ...init,
     headers: {
-      "content-type": "application/json",
+      ...(hasBody ? { "content-type": "application/json" } : {}),
       ...(init?.headers ?? {}),
     },
   });
@@ -94,6 +95,7 @@ async function main(): Promise<void> {
     try {
       const res = await apiFetch<{ status: string; indexedPosts: number }>(apiBaseUrl, "/reindex", {
         method: "POST",
+        body: JSON.stringify({}),
       });
       await ctx.reply(`История проиндексирована. Постов: ${res.indexedPosts}`);
     } catch (error) {

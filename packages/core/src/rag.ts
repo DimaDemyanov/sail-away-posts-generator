@@ -15,6 +15,8 @@ const TOPIC_SEEDS = [
   "Пост с ответами на вопросы подписчиков",
 ];
 
+const MAX_RETRIEVAL_POSTS = 1200;
+
 interface RagOptions {
   apiKey: string;
   model: string;
@@ -123,7 +125,8 @@ export async function buildNext10PlanRag(posts: IndexedPost[], options: RagOptio
   const client = new OpenAI({ apiKey: options.apiKey });
   const fallback = buildNext10Plan(posts);
 
-  const postTexts = posts.map((post) => truncate(post.text, 900));
+  const candidatePosts = posts.slice(0, MAX_RETRIEVAL_POSTS);
+  const postTexts = candidatePosts.map((post) => truncate(post.text, 900));
   const [topicEmbeddings, postEmbeddings] = await Promise.all([
     embedTexts(client, options.embeddingModel, TOPIC_SEEDS),
     embedTexts(client, options.embeddingModel, postTexts),
@@ -131,7 +134,7 @@ export async function buildNext10PlanRag(posts: IndexedPost[], options: RagOptio
 
   const contexts: RetrievedContext[] = TOPIC_SEEDS.map((topic, index) => ({
     topic,
-    sources: retrieveForTopic(topicEmbeddings[index] ?? [], posts, postEmbeddings, options.topK),
+    sources: retrieveForTopic(topicEmbeddings[index] ?? [], candidatePosts, postEmbeddings, options.topK),
   }));
 
   const evidence = contexts

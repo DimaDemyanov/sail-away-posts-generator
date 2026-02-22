@@ -16,6 +16,14 @@ interface DraftRequestBody {
   planId?: string;
 }
 
+function resolveHistoryRoot(): string {
+  const fromEnv = process.env.HISTORY_DIR?.trim();
+  if (fromEnv) {
+    return path.resolve(process.cwd(), fromEnv);
+  }
+  return path.resolve(__dirname, "../../../history");
+}
+
 async function main(): Promise<void> {
   const config = loadConfig();
   const app = Fastify({ logger: true });
@@ -31,7 +39,7 @@ async function main(): Promise<void> {
   });
 
   app.post("/reindex", async (_request, reply) => {
-    const historyRoot = path.resolve(process.cwd(), "history");
+    const historyRoot = resolveHistoryRoot();
     try {
       indexedPosts = await loadHistoryFromDir(historyRoot);
       return {
