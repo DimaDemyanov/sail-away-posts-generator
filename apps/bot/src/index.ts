@@ -21,6 +21,12 @@ interface ApiDraft {
   text: string;
   imageOptions: string[];
   sourcePostIds: string[];
+  references?: Array<{
+    id: string;
+    channel: string;
+    snippet: string;
+    url?: string;
+  }>;
   mode: "rag";
 }
 
@@ -489,6 +495,10 @@ async function main(): Promise<void> {
       });
 
       const imageLines = res.draft.imageOptions.map((opt, idx) => `${idx + 1}. ${opt}`);
+      const referenceLines = (res.draft.references ?? []).map((ref, idx) => {
+        const linkOrId = ref.url ? ref.url : `id=${ref.id}`;
+        return `${idx + 1}. ${ref.channel}: ${linkOrId}`;
+      });
       await ctx.reply(
         [
           `Тема: ${res.draft.topic}`,
@@ -498,6 +508,9 @@ async function main(): Promise<void> {
           "",
           "Идеи для изображений:",
           ...imageLines,
+          "",
+          "Похожие посты из других каналов:",
+          ...(referenceLines.length > 0 ? referenceLines : ["Нет ссылок, доступны только sourcePostIds."]),
         ].join("\n"),
       );
     } catch (error) {
@@ -759,10 +772,9 @@ async function main(): Promise<void> {
         targets: targets.length,
       });
 
-      // Test mode: run draft scheduler every 5 minutes (UTC).
-      const draftSlotMinute = utc.minute - (utc.minute % 5);
-      const draftSlotKey = `${utc.dateKey}-${utc.hour}-${draftSlotMinute}`;
-      if (utc.minute % 5 === 0 && draftSlotKey !== lastDraftSlotKey) {
+      // Production mode: Thursday 09:00 UTC draft scheduler.
+      const draftSlotKey = `${utc.dateKey}-thu-0900`;
+      if (utc.weekday === 4 && utc.hour === 9 && utc.minute === 0 && draftSlotKey !== lastDraftSlotKey) {
         console.info("[scheduler:draft.trigger]", {
           dateKey: utc.dateKey,
           hourUtc: utc.hour,
@@ -778,10 +790,9 @@ async function main(): Promise<void> {
         lastDraftSlotKey = draftSlotKey;
       }
 
-      // Test mode: run reminder scheduler every 5 minutes with +2 min offset (UTC).
-      const reminderSlotMinute = utc.minute - ((utc.minute + 3) % 5);
-      const reminderSlotKey = `${utc.dateKey}-${utc.hour}-${reminderSlotMinute}`;
-      if (utc.minute % 5 === 2 && reminderSlotKey !== lastReminderSlotKey) {
+      // Production mode: Sunday 09:00 UTC reminder scheduler.
+      const reminderSlotKey = `${utc.dateKey}-sun-0900`;
+      if (utc.weekday === 0 && utc.hour === 9 && utc.minute === 0 && reminderSlotKey !== lastReminderSlotKey) {
         console.info("[scheduler:reminder.trigger]", {
           dateKey: utc.dateKey,
           hourUtc: utc.hour,

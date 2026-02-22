@@ -1,4 +1,5 @@
 import OpenAI from "openai";
+import path from "node:path";
 import type { IndexedPost } from "./history";
 
 const MAX_DRAFT_RETRIEVAL_POSTS = 1200;
@@ -17,7 +18,15 @@ export interface DraftResult {
   text: string;
   imageOptions: string[];
   sourcePostIds: string[];
+  references: DraftReference[];
   mode: "rag";
+}
+
+export interface DraftReference {
+  id: string;
+  channel: string;
+  snippet: string;
+  url?: string;
 }
 
 interface DraftModelResponse {
@@ -115,6 +124,22 @@ function parseDraftResponse(raw: string): DraftModelResponse | null {
   } catch {
     return null;
   }
+}
+
+function isSimilarSource(post: IndexedPost): boolean {
+  return /[\\/]history[\\/]similar[\\/]/i.test(post.sourceFile);
+}
+
+function tryBuildTelegramUrl(post: IndexedPost): string | undefined {
+  const filename = path.basename(post.sourceFile, path.extname(post.sourceFile));
+  const slug = filename.replace(/[^A-Za-z0-9_]/g, "");
+  if (!slug || !/^[A-Za-z0-9_]{5,}$/.test(slug)) {
+    return undefined;
+  }
+  if (!/^\d+$/.test(post.id)) {
+    return undefined;
+  }
+  return `https://t.me/s/${slug}/${post.id}`;
 }
 
 export async function buildDraftPostRag(
@@ -218,11 +243,22 @@ export async function buildDraftPostRag(
           .filter((id) => sourceIdsFromContext.has(id))
       : retrieved.map((p) => p.id);
 
+  const references: DraftReference[] = retrieved
+    .filter((post) => isSimilarSource(post))
+    .slice(0, 5)
+    .map((post) => ({
+      id: post.id,
+      channel: post.channel,
+      snippet: truncate(post.text, 140),
+      url: tryBuildTelegramUrl(post),
+    }));
+
   return {
     topic,
     mode: "rag",
     text: parsed.text.trim(),
     imageOptions,
+    references,
     sourcePostIds:
       sourcePostIds.length > 0 ? sourcePostIds : retrieved.map((p) => p.id),
   };
