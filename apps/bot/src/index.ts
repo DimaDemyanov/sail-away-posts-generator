@@ -80,27 +80,10 @@ async function main(): Promise<void> {
         "Sail Away Bot",
         "",
         "Команды:",
-        "/reindex",
         "/plan10",
         "/draft <номер_поста_1_до_10>",
       ].join("\n"),
     );
-  });
-
-  bot.command("reindex", async (ctx) => {
-    if (!ensureAllowed(ctx.from.id, adminIds)) {
-      await ctx.reply("Доступ запрещен.");
-      return;
-    }
-    try {
-      const res = await apiFetch<{ status: string; indexedPosts: number }>(apiBaseUrl, "/reindex", {
-        method: "POST",
-        body: JSON.stringify({}),
-      });
-      await ctx.reply(`История проиндексирована. Постов: ${res.indexedPosts}`);
-    } catch (error) {
-      await ctx.reply(`Ошибка reindex: ${(error as Error).message}`);
-    }
   });
 
   bot.command("plan10", async (ctx) => {

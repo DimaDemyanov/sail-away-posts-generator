@@ -27,7 +27,16 @@ function resolveHistoryRoot(): string {
 async function main(): Promise<void> {
   const config = loadConfig();
   const app = Fastify({ logger: true });
+  const historyRoot = resolveHistoryRoot();
   let indexedPosts: IndexedPost[] = [];
+
+  try {
+    indexedPosts = await loadHistoryFromDir(historyRoot);
+    app.log.info({ indexedPosts: indexedPosts.length, historyRoot }, "History indexed on startup");
+  } catch (error) {
+    app.log.error({ err: error, historyRoot }, "Failed to index history on startup");
+    throw error;
+  }
 
   app.get("/health", async () => {
     return {
@@ -38,28 +47,11 @@ async function main(): Promise<void> {
     };
   });
 
-  app.post("/reindex", async (_request, reply) => {
-    const historyRoot = resolveHistoryRoot();
-    try {
-      indexedPosts = await loadHistoryFromDir(historyRoot);
-      return {
-        status: "ok",
-        indexedPosts: indexedPosts.length,
-      };
-    } catch (error) {
-      app.log.error(error);
-      return reply.code(500).send({
-        status: "error",
-        message: "Не удалось обработать файлы истории из ./history",
-      });
-    }
-  });
-
   app.get("/plan/next10", async (_request, reply) => {
     if (indexedPosts.length === 0) {
       return reply.code(400).send({
         status: "error",
-        message: "No indexed history. Call POST /reindex first.",
+        message: "History is empty after startup indexing.",
       });
     }
     const plan = config.openaiApiKey
@@ -111,7 +103,7 @@ async function main(): Promise<void> {
     if (indexedPosts.length === 0) {
       return reply.code(400).send({
         status: "error",
-        message: "No indexed history. Call POST /reindex first.",
+        message: "History is empty after startup indexing.",
       });
     }
 

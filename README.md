@@ -14,7 +14,7 @@ npm run dev:api
 ```
 
 Then:
-1. `POST /reindex` to load JSON history from `./history`
+1. History is indexed automatically on API startup from `./history`
 2. `GET /plan/next10` to get the first 10-post plan
 3. `GET /plan/latest` to get the last saved plan
 4. `POST /draft` to generate post text + image options
@@ -25,7 +25,6 @@ Then:
 
 Example:
 ```bash
-curl -X POST http://localhost:3000/reindex
 curl http://localhost:3000/plan/next10
 curl http://localhost:3000/plan/latest
 curl -X POST http://localhost:3000/draft \
@@ -47,7 +46,6 @@ npm run dev:bot
 ```
 
 Commands:
-- `/reindex`
 - `/plan10`
 - `/draft <1..10>`
 
