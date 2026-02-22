@@ -1,32 +1,48 @@
 import OpenAI from "openai";
 import type { IndexedPost } from "./history";
-import { buildNext10Plan, type PlanItem } from "./planner";
-
-const TOPIC_SEEDS = [
-  "История маршрута из последнего путешествия",
-  "Практический совет по управлению яхтой в реальных условиях",
-  "Обзор марины: что важно знать перед заходом",
-  "Жизнь экипажа за кадром",
-  "Разбор погодного окна и решения по выходу",
-  "Урок навигации на примере реального перехода",
-  "Проверка и обслуживание лодки перед выходом",
-  "Фотоистория о любимой якорной стоянке",
-  "Как мы планируем провизию и бюджет в походе",
-  "Пост с ответами на вопросы подписчиков",
-];
+import type { PlanItem } from "./planner";
 
 const MAX_RETRIEVAL_POSTS = 1200;
+const MAX_SEED_SOURCE_POSTS = 120;
+const TOPIC_SEED_COUNT = 10;
+const LLM_LOG_MAX_CHARS = 1200;
 
 interface RagOptions {
   apiKey: string;
   model: string;
   embeddingModel: string;
   topK: number;
+  avoidTopics?: string[];
 }
 
 interface RetrievedContext {
   topic: string;
   sources: IndexedPost[];
+}
+
+export interface RagPlanResult {
+  plan: PlanItem[];
+  topicSeeds: string[];
+}
+
+function clip(text: string, max = LLM_LOG_MAX_CHARS): string {
+  return text.length <= max ? text : `${text.slice(0, max)}...`;
+}
+
+function logLlmInfo(event: string, payload: Record<string, unknown>): void {
+  try {
+    console.info(`[llm:${event}]`, JSON.stringify(payload));
+  } catch {
+    console.info(`[llm:${event}]`, payload);
+  }
+}
+
+function logLlmRawResponse(event: string, response: unknown): void {
+  try {
+    console.info(`[llm:${event}.raw]`, JSON.stringify(response));
+  } catch {
+    console.info(`[llm:${event}.raw]`, response);
+  }
 }
 
 function normalize(text: string): string {
@@ -68,71 +84,202 @@ function retrieveForTopic(
   postEmbeddings: number[][],
   topK: number,
 ): IndexedPost[] {
-  return posts
+  const ranked = posts
     .map((post, idx) => ({
       post,
       score: cosineSimilarity(topicEmbedding, postEmbeddings[idx] ?? []),
     }))
+    .sort((a, b) => b.score - a.score);
+
+  const diversityPool = Math.min(ranked.length, Math.max(topK * 3, topK));
+  const pool = ranked.slice(0, diversityPool);
+  const shuffled = pool.sort(() => Math.random() - 0.5);
+
+  return shuffled.slice(0, topK).map((entry) => entry.post);
+}
+
+function normalizeTopic(text: string): string {
+  return text.toLowerCase().replace(/\s+/g, " ").trim();
+}
+
+function computeRecencyScore(publishedAt: string): number {
+  const ts = Date.parse(publishedAt);
+  if (Number.isNaN(ts)) return 0;
+  const ageDays = (Date.now() - ts) / (1000 * 60 * 60 * 24);
+  const windowDays = 730;
+  return Math.max(0, 1 - ageDays / windowDays);
+}
+
+function computeEngagementScore(post: IndexedPost, maxLogReactions: number): number {
+  const reactions = post.metrics?.reactions ?? 0;
+  if (maxLogReactions <= 0) return 0;
+  return Math.log1p(Math.max(0, reactions)) / maxLogReactions;
+}
+
+function pickSeedCandidates(posts: IndexedPost[]): IndexedPost[] {
+  const candidatePool = posts.slice(0, Math.min(posts.length, MAX_RETRIEVAL_POSTS));
+  const maxReactions = candidatePool.reduce((max, post) => Math.max(max, post.metrics?.reactions ?? 0), 0);
+  const maxLogReactions = Math.log1p(maxReactions);
+
+  return candidatePool
+    .map((post) => {
+      const recency = computeRecencyScore(post.published_at);
+      const engagement = computeEngagementScore(post, maxLogReactions);
+      const score = recency * 0.55 + engagement * 0.45;
+      return { post, score };
+    })
     .sort((a, b) => b.score - a.score)
-    .slice(0, topK)
+    .slice(0, MAX_SEED_SOURCE_POSTS)
     .map((entry) => entry.post);
 }
 
-function parsePlanResponse(raw: string, fallback: PlanItem[]): PlanItem[] {
+function parseTopicSeeds(raw: string): string[] | null {
   const start = raw.indexOf("[");
   const end = raw.lastIndexOf("]");
-  if (start === -1 || end === -1 || end <= start) return fallback;
-
+  if (start === -1 || end === -1 || end <= start) return null;
   try {
-    const parsed = JSON.parse(raw.slice(start, end + 1)) as Array<Partial<PlanItem>>;
-    if (!Array.isArray(parsed) || parsed.length === 0) return fallback;
-
-    const normalized = parsed.slice(0, 10).map((item, index) => ({
-      rank: index + 1,
-      topic: typeof item.topic === "string" && item.topic.trim() ? item.topic.trim() : fallback[index]?.topic ?? "",
-      objective:
-        item.objective === "engagement" || item.objective === "storytelling" || item.objective === "promotion"
-          ? item.objective
-          : fallback[index]?.objective ?? "engagement",
-      tone:
-        item.tone === "inspiring" || item.tone === "casual" || item.tone === "adventure"
-          ? item.tone
-          : fallback[index]?.tone ?? "inspiring",
-      cta: typeof item.cta === "string" && item.cta.trim() ? item.cta.trim() : fallback[index]?.cta ?? "",
-      sourcePostIds: Array.isArray(item.sourcePostIds)
-        ? item.sourcePostIds.filter((id): id is string => typeof id === "string")
-        : fallback[index]?.sourcePostIds ?? [],
-    }));
-
-    while (normalized.length < 10) {
-      normalized.push(fallback[normalized.length]);
+    const parsed = JSON.parse(raw.slice(start, end + 1)) as unknown;
+    if (!Array.isArray(parsed)) return null;
+    const unique = new Set<string>();
+    for (const item of parsed) {
+      if (typeof item !== "string") continue;
+      const normalized = item.trim();
+      if (!normalized) continue;
+      unique.add(normalized);
+      if (unique.size >= TOPIC_SEED_COUNT) break;
     }
-
-    return normalized;
+    return unique.size === TOPIC_SEED_COUNT ? Array.from(unique) : null;
   } catch {
-    return fallback;
+    return null;
   }
 }
 
-export async function buildNext10PlanRag(posts: IndexedPost[], options: RagOptions): Promise<PlanItem[]> {
+async function deriveTopicSeedsFromHistory(client: OpenAI, model: string, posts: IndexedPost[]): Promise<string[]> {
+  const seedCandidates = pickSeedCandidates(posts);
+  if (seedCandidates.length === 0) {
+    throw new Error("seed_candidates_empty");
+  }
+
+  const evidence = seedCandidates
+    .map((post) => {
+      const reactions = post.metrics?.reactions ?? 0;
+      return `- date=${post.published_at}; reactions=${reactions}; text="${truncate(post.text, 220)}"`;
+    })
+    .join("\n");
+
+  const prompt = [
+    "Сформируй РОВНО 10 тем для следующих постов Telegram-канала про яхтинг.",
+    "Ориентируйся на более свежие и более вовлекающие посты из контекста.",
+    "Темы должны быть разнообразными, без дублей, короткими (до 12 слов).",
+    "КРИТИЧНО: верни только JSON-массив из 10 строк.",
+    "Нельзя добавлять markdown, пояснения, нумерацию, код-блоки или любой текст вне JSON.",
+    'Формат ответа строго такой: ["тема 1","тема 2",...,"тема 10"]',
+    "Перед ответом проверь, что элементов ровно 10 и они уникальны.",
+    "",
+    "Контекст постов:",
+    evidence,
+  ].join("\n");
+
+  logLlmInfo("topic_seeds.request", {
+    model,
+    promptChars: prompt.length,
+    candidates: seedCandidates.length,
+  });
+
+  const response = await client.responses.create({
+    model,
+    input: prompt,
+    max_output_tokens: 1200,
+    reasoning: { effort: "minimal" },
+  });
+  logLlmRawResponse("topic_seeds.response", response);
+
+  const outputText = response.output_text ?? "";
+  logLlmInfo("topic_seeds.response", {
+    model,
+    outputChars: outputText.length,
+    outputPreview: clip(outputText),
+  });
+
+  const parsed = parseTopicSeeds(outputText);
+  if (!parsed) {
+    logLlmInfo("topic_seeds.parse_error", {
+      reason: "invalid_topic_seeds",
+      outputPreview: clip(outputText),
+    });
+    throw new Error("invalid_topic_seeds");
+  }
+  logLlmInfo("topic_seeds.parsed", { count: parsed.length, topics: parsed });
+  return parsed;
+}
+
+function parsePlanResponse(raw: string): PlanItem[] | null {
+  const start = raw.indexOf("[");
+  const end = raw.lastIndexOf("]");
+  if (start === -1 || end === -1 || end <= start) return null;
+
+  try {
+    const parsed = JSON.parse(raw.slice(start, end + 1)) as Array<Partial<PlanItem>>;
+    if (!Array.isArray(parsed) || parsed.length < TOPIC_SEED_COUNT) return null;
+
+    const normalized = parsed.slice(0, TOPIC_SEED_COUNT).map((item, index) => {
+      if (
+        typeof item.topic !== "string" ||
+        (item.objective !== "engagement" && item.objective !== "storytelling" && item.objective !== "promotion") ||
+        (item.tone !== "inspiring" && item.tone !== "casual" && item.tone !== "adventure") ||
+        typeof item.cta !== "string"
+      ) {
+        throw new Error("invalid_plan_item");
+      }
+
+      return {
+        rank: index + 1,
+        topic: item.topic.trim(),
+        objective: item.objective,
+        tone: item.tone,
+        cta: item.cta.trim(),
+        sourcePostIds: Array.isArray(item.sourcePostIds)
+          ? item.sourcePostIds.filter((id): id is string => typeof id === "string")
+          : [],
+      } as PlanItem;
+    });
+
+    return normalized;
+  } catch {
+    return null;
+  }
+}
+
+function applyTopicAvoidanceStrict(plan: PlanItem[], avoidTopics: string[] | undefined): PlanItem[] {
+  if (!avoidTopics || avoidTopics.length === 0) return plan;
+
+  const avoidSet = new Set(avoidTopics.map(normalizeTopic));
+  const filtered = plan.filter((item) => !avoidSet.has(normalizeTopic(item.topic)));
+  if (filtered.length < TOPIC_SEED_COUNT) {
+    throw new Error("insufficient_unique_topics_after_avoidance");
+  }
+  return filtered.slice(0, TOPIC_SEED_COUNT).map((item, index) => ({ ...item, rank: index + 1 }));
+}
+
+export async function buildNext10PlanRag(posts: IndexedPost[], options: RagOptions): Promise<RagPlanResult> {
   if (!options.apiKey) {
-    return buildNext10Plan(posts);
+    throw new Error("missing_api_key");
   }
   if (posts.length === 0) {
-    return buildNext10Plan(posts);
+    throw new Error("empty_posts");
   }
 
   const client = new OpenAI({ apiKey: options.apiKey });
-  const fallback = buildNext10Plan(posts);
+  const topicSeeds = await deriveTopicSeedsFromHistory(client, options.model, posts);
 
   const candidatePosts = posts.slice(0, MAX_RETRIEVAL_POSTS);
   const postTexts = candidatePosts.map((post) => truncate(post.text, 900));
   const [topicEmbeddings, postEmbeddings] = await Promise.all([
-    embedTexts(client, options.embeddingModel, TOPIC_SEEDS),
+    embedTexts(client, options.embeddingModel, topicSeeds),
     embedTexts(client, options.embeddingModel, postTexts),
   ]);
 
-  const contexts: RetrievedContext[] = TOPIC_SEEDS.map((topic, index) => ({
+  const contexts: RetrievedContext[] = topicSeeds.map((topic, index) => ({
     topic,
     sources: retrieveForTopic(topicEmbeddings[index] ?? [], candidatePosts, postEmbeddings, options.topK),
   }));
@@ -157,26 +304,50 @@ export async function buildNext10PlanRag(posts: IndexedPost[], options: RagOptio
     evidence,
   ].join("\n");
 
-  try {
-    const response = await client.responses.create({
-      model: options.model,
-      input: prompt,
-      max_output_tokens: 1800,
-    });
+  logLlmInfo("plan.request", {
+    model: options.model,
+    embeddingModel: options.embeddingModel,
+    promptChars: prompt.length,
+    topicSeedsCount: topicSeeds.length,
+    candidatePosts: candidatePosts.length,
+  });
 
-    const text = response.output_text ?? "";
-    return parsePlanResponse(text, fallback).map((item, index) => {
-      const sourceIds =
-        item.sourcePostIds.length > 0
-          ? item.sourcePostIds
-          : contexts[index]?.sources.map((p) => p.id) ?? [];
-      return {
-        ...item,
-        rank: index + 1,
-        sourcePostIds: sourceIds,
-      };
+  const response = await client.responses.create({
+    model: options.model,
+    input: prompt,
+    max_output_tokens: 2200,
+    reasoning: { effort: "minimal" },
+  });
+  logLlmRawResponse("plan.response", response);
+
+  const outputText = response.output_text ?? "";
+  logLlmInfo("plan.response", {
+    model: options.model,
+    outputChars: outputText.length,
+    outputPreview: clip(outputText),
+  });
+
+  const parsedPlan = parsePlanResponse(outputText);
+  if (!parsedPlan) {
+    logLlmInfo("plan.parse_error", {
+      reason: "invalid_plan_response",
+      outputPreview: clip(outputText),
     });
-  } catch {
-    return fallback;
+    throw new Error("invalid_plan_response");
   }
+
+  const generated = parsedPlan.map((item, index) => {
+    const sourceIds =
+      item.sourcePostIds.length > 0 ? item.sourcePostIds : contexts[index]?.sources.map((p) => p.id) ?? [];
+    return {
+      ...item,
+      rank: index + 1,
+      sourcePostIds: sourceIds,
+    };
+  });
+
+  return {
+    plan: applyTopicAvoidanceStrict(generated, options.avoidTopics),
+    topicSeeds,
+  };
 }

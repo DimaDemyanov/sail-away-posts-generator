@@ -1,8 +1,17 @@
 import { Telegraf } from "telegraf";
 
-interface ApiPlanItem {
+interface ApiQueueItem {
   rank: number;
   topic: string;
+  weekStart: string;
+  weekEnd: string;
+}
+
+interface ApiQueueResponse {
+  status: string;
+  mode?: "rag";
+  queueId?: string;
+  queue?: unknown;
 }
 
 interface ApiDraft {
@@ -10,13 +19,13 @@ interface ApiDraft {
   text: string;
   imageOptions: string[];
   sourcePostIds: string[];
-  mode: "rag" | "heuristic";
+  mode: "rag";
 }
 
-interface ApiLatestPlan {
+interface ApiLatestQueue {
   status: "ok" | "error";
-  planId?: string;
-  plan?: ApiPlanItem[];
+  queueId?: string;
+  queue?: ApiQueueItem[];
   message?: string;
 }
 
@@ -41,6 +50,12 @@ function parseAdminIds(raw: string): Set<number> {
   );
 }
 
+function parseTargetChatId(raw: string | undefined): number | null {
+  if (!raw?.trim()) return null;
+  const value = Number(raw.trim());
+  return Number.isFinite(value) ? value : null;
+}
+
 async function apiFetch<T>(baseUrl: string, path: string, init?: RequestInit): Promise<T> {
   const hasBody = init?.body !== undefined && init?.body !== null;
   const res = await fetch(`${baseUrl}${path}`, {
@@ -63,16 +78,66 @@ function ensureAllowed(userId: number, adminIds: Set<number>): boolean {
   return adminIds.has(userId);
 }
 
+function parseTopicsText(raw: string): string[] {
+  const lines = raw
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  return lines.map((line) => line.replace(/^\d+\.\s*/, "").trim()).filter(Boolean);
+}
+
+function formatQueueLines(queue: ApiQueueItem[]): string[] {
+  return queue.map((item) => `${item.rank}. ${item.topic}\nНеделя: ${item.weekStart} - ${item.weekEnd}`);
+}
+
+function getZonedNowParts(timeZone: string): { weekday: string; hour: number; minute: number; dateKey: string } {
+  const dtf = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    weekday: "short",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+  const parts = dtf.formatToParts(new Date());
+  const map = new Map(parts.map((p) => [p.type, p.value]));
+  const weekday = map.get("weekday") ?? "";
+  const year = map.get("year") ?? "0000";
+  const month = map.get("month") ?? "01";
+  const day = map.get("day") ?? "01";
+  const hour = Number(map.get("hour") ?? "0");
+  const minute = Number(map.get("minute") ?? "0");
+  return {
+    weekday,
+    hour: Number.isFinite(hour) ? hour : 0,
+    minute: Number.isFinite(minute) ? minute : 0,
+    dateKey: `${year}-${month}-${day}`,
+  };
+}
+
 async function main(): Promise<void> {
   const botToken = getEnv("TELEGRAM_BOT_TOKEN");
   const apiBaseUrl = getOptionalEnv("API_BASE_URL", "http://localhost:3000");
   const adminIds = parseAdminIds(getEnv("ADMIN_TELEGRAM_IDS"));
+  const targetChatId = parseTargetChatId(process.env.TELEGRAM_TARGET_CHAT_ID);
+  const botTimeZone = getOptionalEnv("BOT_TIMEZONE", "Europe/Moscow");
+  const weeklyPostHour = Number(getOptionalEnv("WEEKLY_POST_HOUR", "9"));
+  const weeklyPostMinute = Number(getOptionalEnv("WEEKLY_POST_MINUTE", "0"));
 
   const bot = new Telegraf(botToken);
+  const replaceModeUsers = new Set<number>();
+
   await bot.telegram.setMyCommands([
     { command: "start", description: "Показать справку" },
-    { command: "plan10", description: "Сгенерировать план из 10 постов" },
+    { command: "queue10", description: "Сгенерировать очередь из 10 постов" },
+    { command: "queuelatest", description: "Показать последнюю сохраненную очередь" },
     { command: "draft", description: "Сгенерировать драфт: /draft 1" },
+    { command: "replaceposts", description: "Заменить все 10 тем очереди" },
+    { command: "swapposts", description: "Поменять 2 поста местами: /swapposts 2 5" },
+    { command: "plan10", description: "Алиас /queue10" },
+    { command: "planlatest", description: "Алиас /queuelatest" },
   ]);
 
   bot.start(async (ctx) => {
@@ -85,31 +150,60 @@ async function main(): Promise<void> {
         "Sail Away Bot",
         "",
         "Команды:",
-        "/plan10",
+        "/queue10",
+        "/queuelatest",
         "/draft <номер_поста_1_до_10>",
+        "/replaceposts",
+        "/swapposts <from> <to>",
       ].join("\n"),
     );
   });
 
-  bot.command("plan10", async (ctx) => {
+  const handleQueue10 = async (ctx: { from: { id: number }; reply: (text: string) => Promise<unknown> }) => {
     if (!ensureAllowed(ctx.from.id, adminIds)) {
       await ctx.reply("Доступ запрещен.");
       return;
     }
     try {
-      const res = await apiFetch<{
-        status: string;
-        mode: "rag" | "heuristic";
-        planId: string;
-        plan: ApiPlanItem[];
-      }>(apiBaseUrl, "/plan/next10");
+      const res = await apiFetch<ApiQueueResponse>(apiBaseUrl, "/queue/next10");
+      if (!Array.isArray(res.queue)) {
+        await ctx.reply(
+          `Ошибка queue10: некорректный формат ответа API (queue не массив). payload=${JSON.stringify(res).slice(0, 300)}`,
+        );
+        return;
+      }
 
-      const lines = res.plan.map((item) => `${item.rank}. ${item.topic}`);
-      await ctx.reply([`План создан (${res.mode})`, `planId: ${res.planId}`, "", ...lines].join("\n"));
+      const lines = formatQueueLines(res.queue as ApiQueueItem[]);
+      await ctx.reply(
+        [`Очередь создана (${res.mode ?? "unknown"})`, `queueId: ${res.queueId ?? "n/a"}`, "", ...lines].join("\n\n"),
+      );
     } catch (error) {
-      await ctx.reply(`Ошибка plan10: ${(error as Error).message}`);
+      await ctx.reply(`Ошибка queue10: ${(error as Error).message}`);
     }
-  });
+  };
+  bot.command("queue10", async (ctx) => handleQueue10(ctx));
+  bot.command("plan10", async (ctx) => handleQueue10(ctx));
+
+  const handleQueueLatest = async (ctx: { from: { id: number }; reply: (text: string) => Promise<unknown> }) => {
+    if (!ensureAllowed(ctx.from.id, adminIds)) {
+      await ctx.reply("Доступ запрещен.");
+      return;
+    }
+    try {
+      const latest = await apiFetch<ApiLatestQueue>(apiBaseUrl, "/queue/latest");
+      if (!latest.queueId || !Array.isArray(latest.queue)) {
+        await ctx.reply("Нет сохраненной очереди. Сначала вызовите /queue10");
+        return;
+      }
+
+      const lines = formatQueueLines(latest.queue);
+      await ctx.reply([`Последняя очередь`, `queueId: ${latest.queueId}`, "", ...lines].join("\n\n"));
+    } catch (error) {
+      await ctx.reply(`Ошибка queuelatest: ${(error as Error).message}`);
+    }
+  };
+  bot.command("queuelatest", async (ctx) => handleQueueLatest(ctx));
+  bot.command("planlatest", async (ctx) => handleQueueLatest(ctx));
 
   bot.command("draft", async (ctx) => {
     if (!ensureAllowed(ctx.from.id, adminIds)) {
@@ -125,17 +219,17 @@ async function main(): Promise<void> {
     }
 
     try {
-      const latest = await apiFetch<ApiLatestPlan>(apiBaseUrl, "/plan/latest");
-      if (!latest.planId) {
-        await ctx.reply("Нет сохраненного плана. Сначала вызовите /plan10");
+      const latest = await apiFetch<ApiLatestQueue>(apiBaseUrl, "/queue/latest");
+      if (!latest.queueId) {
+        await ctx.reply("Нет сохраненной очереди. Сначала вызовите /queue10");
         return;
       }
 
       const res = await apiFetch<{ status: string; draft: ApiDraft }>(apiBaseUrl, "/draft", {
         method: "POST",
         body: JSON.stringify({
-          planItem,
-          planId: latest.planId,
+          queueItem: planItem,
+          queueId: latest.queueId,
         }),
       });
 
@@ -156,15 +250,120 @@ async function main(): Promise<void> {
     }
   });
 
+  bot.command("replaceposts", async (ctx) => {
+    if (!ensureAllowed(ctx.from.id, adminIds)) {
+      await ctx.reply("Доступ запрещен.");
+      return;
+    }
+    replaceModeUsers.add(ctx.from.id);
+    await ctx.reply(
+      "Отправьте 10 тем сообщением (каждая с новой строки). Можно в формате `1. Тема` ... `10. Тема`.",
+      { parse_mode: "Markdown" },
+    );
+  });
+
+  bot.command("swapposts", async (ctx) => {
+    if (!ensureAllowed(ctx.from.id, adminIds)) {
+      await ctx.reply("Доступ запрещен.");
+      return;
+    }
+
+    const args = ctx.message.text.split(" ").slice(1).map((a) => Number(a.trim()));
+    const from = args[0];
+    const to = args[1];
+    if (!Number.isFinite(from) || !Number.isFinite(to)) {
+      await ctx.reply("Использование: /swapposts <from_1_до_10> <to_1_до_10>");
+      return;
+    }
+
+    try {
+      const res = await apiFetch<{ status: string; queue: ApiQueueItem[] }>(apiBaseUrl, "/queue/swap", {
+        method: "POST",
+        body: JSON.stringify({ from, to }),
+      });
+      const lines = formatQueueLines(res.queue);
+      await ctx.reply([`Очередь обновлена`, "", ...lines].join("\n\n"));
+    } catch (error) {
+      await ctx.reply(`Ошибка swapposts: ${(error as Error).message}`);
+    }
+  });
+
+  bot.on("text", async (ctx, next) => {
+    if (!ensureAllowed(ctx.from.id, adminIds)) {
+      return next();
+    }
+
+    if (!replaceModeUsers.has(ctx.from.id)) {
+      return next();
+    }
+
+    if (ctx.message.text.startsWith("/")) {
+      return next();
+    }
+
+    const topics = parseTopicsText(ctx.message.text);
+    if (topics.length !== 10) {
+      await ctx.reply(`Нужно ровно 10 тем. Сейчас: ${topics.length}. Отправьте заново.`);
+      return;
+    }
+
+    try {
+      const res = await apiFetch<{ status: string; queueId: string; queue: ApiQueueItem[] }>(
+        apiBaseUrl,
+        "/queue/replace",
+        {
+          method: "POST",
+          body: JSON.stringify({ topics }),
+        },
+      );
+      replaceModeUsers.delete(ctx.from.id);
+      const lines = formatQueueLines(res.queue);
+      await ctx.reply([`Очередь заменена`, `queueId: ${res.queueId}`, "", ...lines].join("\n\n"));
+    } catch (error) {
+      await ctx.reply(`Ошибка replaceposts: ${(error as Error).message}`);
+    }
+  });
+
   bot.catch(async (error, ctx) => {
     console.error("bot error", error);
     await ctx.reply("Внутренняя ошибка бота.");
   });
 
   await bot.launch();
+  let lastWeeklyPublicationDate = "";
+  setInterval(async () => {
+    try {
+      const now = getZonedNowParts(botTimeZone);
+      if (
+        now.weekday === "Sun" &&
+        now.hour === weeklyPostHour &&
+        now.minute === weeklyPostMinute &&
+        now.dateKey !== lastWeeklyPublicationDate
+      ) {
+        const res = await apiFetch<ApiQueueResponse>(apiBaseUrl, "/queue/next10");
+        if (!Array.isArray(res.queue)) return;
+        const lines = formatQueueLines(res.queue as ApiQueueItem[]);
+        const message = [`Еженедельная очередь на 10 недель`, `queueId: ${res.queueId ?? "n/a"}`, "", ...lines].join(
+          "\n\n",
+        );
+        const targets = targetChatId ? [targetChatId] : Array.from(adminIds);
+        for (const chatId of targets) {
+          await bot.telegram.sendMessage(chatId, message);
+        }
+        lastWeeklyPublicationDate = now.dateKey;
+      }
+    } catch (error) {
+      console.error("weekly queue publish failed", error);
+    }
+  }, 60_000);
+
   console.log("bot service started", {
     apiBaseUrl,
     admins: Array.from(adminIds),
+    botTimeZone,
+    weeklyPostHour,
+    weeklyPostMinute,
+    targetChatId,
   });
 
   process.once("SIGINT", () => bot.stop("SIGINT"));

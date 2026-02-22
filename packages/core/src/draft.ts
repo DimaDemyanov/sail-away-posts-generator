@@ -1,6 +1,10 @@
 import OpenAI from "openai";
 import type { IndexedPost } from "./history";
 
+const MAX_DRAFT_RETRIEVAL_POSTS = 1200;
+const EMBEDDING_BATCH_SIZE = 128;
+const LLM_LOG_MAX_CHARS = 1200;
+
 export interface DraftOptions {
   apiKey: string;
   model: string;
@@ -13,13 +17,33 @@ export interface DraftResult {
   text: string;
   imageOptions: string[];
   sourcePostIds: string[];
-  mode: "rag" | "heuristic";
+  mode: "rag";
 }
 
 interface DraftModelResponse {
   text?: string;
   imageOptions?: string[];
   sourcePostIds?: string[];
+}
+
+function clip(text: string, max = LLM_LOG_MAX_CHARS): string {
+  return text.length <= max ? text : `${text.slice(0, max)}...`;
+}
+
+function logLlmInfo(event: string, payload: Record<string, unknown>): void {
+  try {
+    console.info(`[llm:${event}]`, JSON.stringify(payload));
+  } catch {
+    console.info(`[llm:${event}]`, payload);
+  }
+}
+
+function logLlmRawResponse(event: string, response: unknown): void {
+  try {
+    console.info(`[llm:${event}.raw]`, JSON.stringify(response));
+  } catch {
+    console.info(`[llm:${event}.raw]`, response);
+  }
 }
 
 function normalize(text: string): string {
@@ -52,8 +76,17 @@ async function embedTexts(
   model: string,
   inputs: string[],
 ): Promise<number[][]> {
-  const res = await client.embeddings.create({ model, input: inputs });
-  return res.data.map((item) => item.embedding);
+  if (inputs.length === 0) {
+    return [];
+  }
+
+  const embeddings: number[][] = [];
+  for (let i = 0; i < inputs.length; i += EMBEDDING_BATCH_SIZE) {
+    const chunk = inputs.slice(i, i + EMBEDDING_BATCH_SIZE);
+    const res = await client.embeddings.create({ model, input: chunk });
+    embeddings.push(...res.data.map((item) => item.embedding));
+  }
+  return embeddings;
 }
 
 function retrieveForTopic(
@@ -70,32 +103,6 @@ function retrieveForTopic(
     .sort((a, b) => b.score - a.score)
     .slice(0, topK)
     .map((entry) => entry.post);
-}
-
-function buildHeuristicDraft(
-  topic: string,
-  posts: IndexedPost[],
-  topK: number,
-): DraftResult {
-  const sources = posts.slice(0, topK);
-  const sourcePostIds = sources.map((post) => post.id);
-  const sourceHint = sources[0]?.text
-    ? truncate(sources[0].text, 120)
-    : "Недавний опыт команды";
-
-  return {
-    topic,
-    mode: "heuristic",
-    sourcePostIds,
-    text: [
-      `Тема: ${topic}`,
-      "",
-      `${sourceHint}.`,
-      "Расскажите, как это было у вас, и какие решения сработали лучше всего.",
-      "В следующем посте разберем практические детали по этой теме.",
-    ].join("\n"),
-    imageOptions: [],
-  };
 }
 
 function parseDraftResponse(raw: string): DraftModelResponse | null {
@@ -115,82 +122,104 @@ export async function buildDraftPostRag(
   topic: string,
   options: DraftOptions,
 ): Promise<DraftResult> {
-  if (!options.apiKey || posts.length === 0) {
-    return buildHeuristicDraft(topic, posts, options.topK);
+  if (!options.apiKey) {
+    throw new Error("missing_api_key");
+  }
+  if (posts.length === 0) {
+    throw new Error("empty_posts");
   }
 
   const client = new OpenAI({ apiKey: options.apiKey });
-  const postTexts = posts.map((post) => truncate(post.text, 900));
+  const candidatePosts = posts.slice(0, MAX_DRAFT_RETRIEVAL_POSTS);
+  const postTexts = candidatePosts.map((post) => truncate(post.text, 900));
 
-  try {
-    const [topicEmbeddingSet, postEmbeddings] = await Promise.all([
-      embedTexts(client, options.embeddingModel, [topic]),
-      embedTexts(client, options.embeddingModel, postTexts),
-    ]);
+  const [topicEmbeddingSet, postEmbeddings] = await Promise.all([
+    embedTexts(client, options.embeddingModel, [topic]),
+    embedTexts(client, options.embeddingModel, postTexts),
+  ]);
 
-    const retrieved = retrieveForTopic(
-      topicEmbeddingSet[0] ?? [],
-      posts,
-      postEmbeddings,
-      options.topK,
-    );
-    const evidence = retrieved
-      .map(
-        (post) =>
-          `- id=${post.id}; channel=${post.channel}; text="${truncate(post.text, 260)}"`,
-      )
-      .join("\n");
+  const retrieved = retrieveForTopic(
+    topicEmbeddingSet[0] ?? [],
+    candidatePosts,
+    postEmbeddings,
+    options.topK,
+  );
+  const evidence = retrieved
+    .map(
+      (post) =>
+        `- id=${post.id}; channel=${post.channel}; text="${truncate(post.text, 260)}"`,
+    )
+    .join("\n");
 
-    const prompt = [
-      "Сгенерируй пост для Telegram-канала про яхтинг.",
-      `Тема: ${topic}`,
-      "Используй только контекст ниже.",
-      "Верни строго JSON-объект формата:",
-      '{"text":"...","imageOptions":["...","...","..."],"sourcePostIds":["..."]}',
-      "Требования:",
-      "- text: 700-1200 символов, живой стиль, без markdown.",
-      "- imageOptions: 3 короткие идеи для изображений.",
-      "- sourcePostIds: только id из контекста.",
-      "",
-      "Контекст:",
-      evidence,
-    ].join("\n");
+  const prompt = [
+    "Сгенерируй пост для Telegram-канала про яхтинг.",
+    `Тема: ${topic}`,
+    "Используй только контекст ниже.",
+    "Верни строго JSON-объект формата:",
+    '{"text":"...","imageOptions":["...","...","..."],"sourcePostIds":["..."]}',
+    "Требования:",
+    "- text: 700-1200 символов, живой стиль, без markdown.",
+    "- imageOptions: 3 короткие идеи для изображений.",
+    "- sourcePostIds: только id из контекста.",
+    "",
+    "Контекст:",
+    evidence,
+  ].join("\n");
 
-    const response = await client.responses.create({
-      model: options.model,
-      input: prompt,
-      max_output_tokens: 1200,
+  logLlmInfo("draft.request", {
+    model: options.model,
+    embeddingModel: options.embeddingModel,
+    promptChars: prompt.length,
+    candidatePosts: candidatePosts.length,
+    topK: options.topK,
+    topicChars: topic.length,
+  });
+
+  const response = await client.responses.create({
+    model: options.model,
+    input: prompt,
+    max_output_tokens: 1200,
+    reasoning: { effort: "minimal" },
+  });
+  logLlmRawResponse("draft.response", response);
+
+  const outputText = response.output_text ?? "";
+  logLlmInfo("draft.response", {
+    model: options.model,
+    outputChars: outputText.length,
+    outputPreview: clip(outputText),
+  });
+
+  const parsed = parseDraftResponse(outputText);
+  if (!parsed?.text) {
+    logLlmInfo("draft.parse_error", {
+      reason: "invalid_draft_response",
+      outputPreview: clip(outputText),
     });
-
-    const parsed = parseDraftResponse(response.output_text ?? "");
-    if (!parsed?.text) {
-      return buildHeuristicDraft(topic, retrieved, options.topK);
-    }
-
-    const imageOptions =
-      Array.isArray(parsed.imageOptions) && parsed.imageOptions.length > 0
-        ? parsed.imageOptions
-            .filter((item): item is string => typeof item === "string")
-            .slice(0, 5)
-        : [];
-
-    const sourceIdsFromContext = new Set(retrieved.map((p) => p.id));
-    const sourcePostIds =
-      Array.isArray(parsed.sourcePostIds) && parsed.sourcePostIds.length > 0
-        ? parsed.sourcePostIds
-            .filter((id): id is string => typeof id === "string")
-            .filter((id) => sourceIdsFromContext.has(id))
-        : retrieved.map((p) => p.id);
-
-    return {
-      topic,
-      mode: "rag",
-      text: parsed.text.trim(),
-      imageOptions,
-      sourcePostIds:
-        sourcePostIds.length > 0 ? sourcePostIds : retrieved.map((p) => p.id),
-    };
-  } catch {
-    return buildHeuristicDraft(topic, posts, options.topK);
+    throw new Error("invalid_draft_response");
   }
+
+  const imageOptions =
+    Array.isArray(parsed.imageOptions) && parsed.imageOptions.length > 0
+      ? parsed.imageOptions
+          .filter((item): item is string => typeof item === "string")
+          .slice(0, 5)
+      : [];
+
+  const sourceIdsFromContext = new Set(retrieved.map((p) => p.id));
+  const sourcePostIds =
+    Array.isArray(parsed.sourcePostIds) && parsed.sourcePostIds.length > 0
+      ? parsed.sourcePostIds
+          .filter((id): id is string => typeof id === "string")
+          .filter((id) => sourceIdsFromContext.has(id))
+      : retrieved.map((p) => p.id);
+
+  return {
+    topic,
+    mode: "rag",
+    text: parsed.text.trim(),
+    imageOptions,
+    sourcePostIds:
+      sourcePostIds.length > 0 ? sourcePostIds : retrieved.map((p) => p.id),
+  };
 }

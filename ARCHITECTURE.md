@@ -4,7 +4,7 @@
 Build a JavaScript/TypeScript application that:
 - Uses Telegram channel history from JSON files stored in this repository.
 - Uses own-channel and similar-channel history together.
-- Produces a plan for the next 10 posts.
+- Produces a queue for the next 10 weeks.
 - Generates on-demand post drafts with image options.
 - Supports interaction through a Telegram bot.
 
@@ -73,7 +73,7 @@ For planning and drafting:
 
 ## Core Features
 
-### 1) Next 10 Post Plan
+### 1) Next 10 Weeks Queue
 Input:
 - Own-channel history
 - Similar-channel history
@@ -85,12 +85,12 @@ Output per item:
 - objective
 - tone/style
 - suggested CTA
-- suggested schedule slot
+- week slot (`weekStart`, `weekEnd`)
 - supporting source post IDs
 
 ### 2) On-Demand Draft + Image Options
 Input:
-- plan item index or ad-hoc topic
+- queue item index or ad-hoc topic
 - optional constraints (length, platform, tone)
 
 Output:
@@ -100,10 +100,11 @@ Output:
 
 ## Telegram Integration
 Use bot commands as primary interface:
-- `/plan10` -> generate or fetch latest plan
-- `/draft <index|topic>` -> generate draft
-- `/sources <draft_id>` -> show source history references
-- `/reindex` -> trigger JSON reimport job
+- `/queue10` -> generate queue for next 10 weeks
+- `/queuelatest` -> fetch latest saved queue
+- `/replaceposts` -> replace all queue topics with user topics
+- `/swapposts <from> <to>` -> swap 2 queue positions
+- `/draft <index>` -> generate draft for queue item
 
 Bot should call API endpoints; keep LLM logic in backend services, not in bot handlers.
 
@@ -114,18 +115,19 @@ Bot should call API endpoints; keep LLM logic in backend services, not in bot ha
   - `id`, `channel_id`, `external_post_id`, `published_at`, `text`, `media_json`, `metrics_json`
 - `post_embeddings`
   - `post_id`, `embedding` (vector), `model`
-- `plans`
+- `queues`
   - `id`, `created_at`, `params_json`
-- `plan_items`
-  - `id`, `plan_id`, `rank`, `topic`, `objective`, `tone`, `cta`, `schedule_at`, `source_post_ids_json`
+- `queue_items`
+  - `id`, `queue_id`, `rank`, `topic`, `objective`, `tone`, `cta`, `week_start`, `week_end`, `source_post_ids_json`
 - `drafts`
   - `id`, `plan_item_id`, `text`, `image_options_json`, `source_post_ids_json`, `created_at`
 
 ## API Endpoints (MVP)
-- `POST /reindex` -> import JSON history and update embeddings
-- `GET /plan/next10` -> generate or return latest 10-post plan
-- `POST /draft` -> generate draft by plan item or topic
-- `GET /draft/:id/sources` -> citation links and references
+- `GET /queue/next10` -> generate and save 10-week queue
+- `GET /queue/latest` -> return latest saved queue
+- `POST /queue/replace` -> replace 10 queue topics
+- `POST /queue/swap` -> swap two queue items by rank
+- `POST /draft` -> generate draft by queue item or topic
 
 ## Worker Jobs (MVP)
 - `reindex-history`
@@ -143,9 +145,9 @@ Bot should call API endpoints; keep LLM logic in backend services, not in bot ha
 1. Scaffold TS monorepo (`apps/*`, `packages/*`), Prisma schema, and DB migration.
 2. Implement JSON importer + `reindex-history` job.
 3. Add embeddings + retrieval service.
-4. Implement `GET /plan/next10`.
-5. Implement `POST /draft` with image options.
-6. Add Telegram bot commands wired to API.
+4. Implement queue API (`/queue/next10`, `/queue/latest`).
+5. Implement queue mutations (`/queue/replace`, `/queue/swap`) and drafting.
+6. Add Telegram bot commands and weekly Sunday auto-publish.
 
 ## Deployment
 
@@ -172,12 +174,12 @@ Deploy with:
 3. Run DB migrations.
 4. Start API, worker, and bot processes.
 5. Trigger initial history reindex.
-6. Validate bot commands (`/plan10`, `/draft`).
+6. Validate bot commands (`/queue10`, `/queuelatest`, `/replaceposts`, `/swapposts`, `/draft`).
 
 ### Initial Data Bootstrap
 - Import all `history/**/*.json` into DB.
 - Generate embeddings for imported posts.
-- Run one `plan_next_10` generation to validate end-to-end flow.
+- Run one `queue_next_10_weeks` generation to validate end-to-end flow.
 
 ### Operations
 - Reindex when JSON history changes (manual or scheduled).
@@ -201,4 +203,4 @@ Deploy with:
 - [ ] `TELEGRAM_BOT_TOKEN` configured.
 - [ ] DB migrations applied.
 - [ ] Initial reindex completed.
-- [ ] Bot responds to `/plan10`.
+- [ ] Bot responds to `/queue10`.
