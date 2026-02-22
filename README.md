@@ -52,6 +52,7 @@ curl -X POST http://localhost:3000/draft \
 - `/draft <index>` -> generate draft for queue item
 - `/replaceposts` -> update topics list with any number of topics
 - `/addtopic <тема>` -> add one topic to the end of queue
+- `/removetopic <index>` -> remove one topic by position
 - `/swapposts <from> <to>` -> swap queue items
 
 ## Weekly Auto-Publish

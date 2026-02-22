@@ -1,4 +1,4 @@
-import { Telegraf } from "telegraf";
+import { Markup, Telegraf } from "telegraf";
 
 interface ApiQueueItem {
   rank: number;
@@ -139,6 +139,25 @@ function getZonedNowParts(timeZone: string): { weekday: string; hour: number; mi
   };
 }
 
+function getUtcNowParts(): { weekday: number; hour: number; minute: number; dateKey: string } {
+  const now = new Date();
+  return {
+    weekday: now.getUTCDay(),
+    hour: now.getUTCHours(),
+    minute: now.getUTCMinutes(),
+    dateKey: now.toISOString().slice(0, 10),
+  };
+}
+
+function getCurrentWeekItem(queue: ApiQueueItem[], dateKey: string): ApiQueueItem | null {
+  for (const item of queue) {
+    if (item.weekStart <= dateKey && dateKey <= item.weekEnd) {
+      return item;
+    }
+  }
+  return null;
+}
+
 async function main(): Promise<void> {
   const botToken = getEnv("TELEGRAM_BOT_TOKEN");
   const apiBaseUrl = getOptionalEnv("API_BASE_URL", "http://localhost:3000");
@@ -183,11 +202,12 @@ async function main(): Promise<void> {
     { command: "start", description: "Показать справку" },
     { command: "queue", description: "Показать текущую очередь постов" },
     { command: "schedule", description: "Показать расписание (с датами)" },
-    { command: "draft", description: "Сгенерировать черновик: /draft 1" },
     { command: "replaceposts", description: "Обновить список тем (любое количество)" },
     { command: "addtopic", description: "Добавить тему в конец списка" },
+    { command: "removetopic", description: "Удалить тему по номеру: /removetopic 3" },
     { command: "swapposts", description: "Поменять 2 поста местами: /swapposts 2 5" },
     { command: "queuesuggest", description: "Предложить 10 новых тем (без замены очереди)" },
+    { command: "draft", description: "Сгенерировать черновик: /draft 1" },
   ]);
 
   bot.start(async (ctx) => {
@@ -202,11 +222,12 @@ async function main(): Promise<void> {
         "Команды:",
         "/queue",
         "/schedule",
-        "/draft <номер_поста>",
         "/replaceposts",
         "/addtopic <тема>",
+        "/removetopic <номер>",
         "/swapposts <from> <to>",
         "/queuesuggest",
+        "/draft <номер_поста>",
       ].join("\n"),
     );
   });
@@ -390,6 +411,68 @@ async function main(): Promise<void> {
     }
   });
 
+  bot.command("removetopic", async (ctx) => {
+    if (!ensureAllowed(ctx.from.id, adminIds)) {
+      await ctx.reply("Доступ запрещен.");
+      return;
+    }
+
+    const index = Number(ctx.message.text.split(" ").slice(1).join(" ").trim());
+    if (!Number.isFinite(index) || index < 1) {
+      await ctx.reply("Использование: /removetopic <номер>");
+      return;
+    }
+
+    try {
+      const res = await apiFetch<{ status: string; queueId: string; queue: ApiQueueItem[] }>(
+        apiBaseUrl,
+        "/queue/remove",
+        {
+          method: "POST",
+          body: JSON.stringify({ index }),
+        },
+      );
+      const lines = formatQueueTopicLines(res.queue);
+      await ctx.reply([`Тема удалена`, `queueId: ${res.queueId}`, "", ...lines].join("\n"));
+    } catch (error) {
+      await ctx.reply(`Ошибка removetopic: ${(error as Error).message}`);
+    }
+  });
+
+  bot.action(/^wk_(delete_yes|keep|delete_no)\|([^|]+)\|(\d+)$/, async (ctx) => {
+    if (!ctx.from || !ensureAllowed(ctx.from.id, adminIds)) {
+      await ctx.answerCbQuery("Доступ запрещен.");
+      return;
+    }
+
+    const action = ctx.match[1];
+    const queueId = ctx.match[2];
+    const index = Number(ctx.match[3]);
+
+    try {
+      if (action === "keep") {
+        await ctx.answerCbQuery("Оставили тему в очереди.");
+        await ctx.reply(`Ок, тема #${index} оставлена в очереди (queueId: ${queueId}).`);
+        return;
+      }
+
+      const res = await apiFetch<{ status: string; queueId: string; queue: ApiQueueItem[] }>(
+        apiBaseUrl,
+        "/queue/remove",
+        {
+          method: "POST",
+          body: JSON.stringify({ index }),
+        },
+      );
+      const lines = formatQueueTopicLines(res.queue);
+      await ctx.answerCbQuery("Тема удалена из очереди.");
+      await ctx.reply([`Тема #${index} удалена`, `queueId: ${res.queueId}`, "", ...lines].join("\n"));
+    } catch (error) {
+      await ctx.answerCbQuery("Ошибка");
+      await ctx.reply(`Ошибка действия по теме #${index}: ${(error as Error).message}`);
+    }
+  });
+
   bot.on("text", async (ctx, next) => {
     if (!ensureAllowed(ctx.from.id, adminIds)) {
       return next();
@@ -445,6 +528,8 @@ async function main(): Promise<void> {
 
   await bot.launch();
   let lastWeeklyPublicationDate = "";
+  let lastThursdayDraftDate = "";
+  let lastSundayReminderDate = "";
   setInterval(async () => {
     try {
       const now = getZonedNowParts(botTimeZone);
@@ -465,6 +550,62 @@ async function main(): Promise<void> {
           await bot.telegram.sendMessage(chatId, message);
         }
         lastWeeklyPublicationDate = now.dateKey;
+      }
+
+      const utc = getUtcNowParts();
+      const targets = targetChatId ? [targetChatId] : Array.from(adminIds);
+
+      // Thursday, 09:00 UTC: send draft for current week topic.
+      if (utc.weekday === 4 && utc.hour === 9 && utc.minute === 0 && utc.dateKey !== lastThursdayDraftDate) {
+        const latest = await tryLoadLatestQueue(apiBaseUrl);
+        if (latest?.queueId && Array.isArray(latest.queue) && latest.queue.length > 0) {
+          const current = getCurrentWeekItem(latest.queue, utc.dateKey);
+          if (current) {
+            const draftRes = await apiFetch<{ status: string; draft: ApiDraft }>(apiBaseUrl, "/draft", {
+              method: "POST",
+              body: JSON.stringify({
+                queueItem: current.rank,
+                queueId: latest.queueId,
+              }),
+            });
+            const message = [
+              "Черновик на текущую неделю",
+              `Тема #${current.rank}: ${current.topic}`,
+              `Неделя: ${current.weekStart} - ${current.weekEnd}`,
+              "",
+              draftRes.draft.text,
+            ].join("\n");
+            for (const chatId of targets) {
+              await bot.telegram.sendMessage(chatId, message);
+            }
+          }
+        }
+        lastThursdayDraftDate = utc.dateKey;
+      }
+
+      // Sunday, 09:00 UTC: reminder for the same week topic with 3 actions.
+      if (utc.weekday === 0 && utc.hour === 9 && utc.minute === 0 && utc.dateKey !== lastSundayReminderDate) {
+        const latest = await tryLoadLatestQueue(apiBaseUrl);
+        if (latest?.queueId && Array.isArray(latest.queue) && latest.queue.length > 0) {
+          const current = getCurrentWeekItem(latest.queue, utc.dateKey);
+          if (current) {
+            const text = [
+              "Напоминание по теме текущей недели",
+              `Тема #${current.rank}: ${current.topic}`,
+              "",
+              "Выберите действие:",
+            ].join("\n");
+            const keyboard = Markup.inlineKeyboard([
+              [Markup.button.callback("Да, удали тему из очереди", `wk_delete_yes|${latest.queueId}|${current.rank}`)],
+              [Markup.button.callback("Нет, не удаляй тему из очереди", `wk_keep|${latest.queueId}|${current.rank}`)],
+              [Markup.button.callback("Нет, удаляй тему из очереди", `wk_delete_no|${latest.queueId}|${current.rank}`)],
+            ]);
+            for (const chatId of targets) {
+              await bot.telegram.sendMessage(chatId, text, keyboard);
+            }
+          }
+        }
+        lastSundayReminderDate = utc.dateKey;
       }
     } catch (error) {
       console.error("weekly queue publish failed", error);

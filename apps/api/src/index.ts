@@ -26,6 +26,10 @@ interface SwapQueueBody {
   to?: number;
 }
 
+interface RemoveQueueBody {
+  index?: number;
+}
+
 function resolveHistoryRoot(): string {
   const fromEnv = process.env.HISTORY_DIR?.trim();
   if (fromEnv) {
@@ -332,6 +336,37 @@ async function main(): Promise<void> {
       status: "ok",
       queueId: latest.queueId,
       queue: normalized,
+    };
+  });
+
+  app.post<{ Body: RemoveQueueBody }>("/queue/remove", async (request, reply) => {
+    const latest = await loadLatestPlan();
+    if (!latest) {
+      return reply.code(404).send({
+        status: "error",
+        message: "No saved queue found. Call GET /queue/next10 first.",
+      });
+    }
+
+    const index = request.body?.index;
+    const maxPosition = latest.queue.length;
+    if (typeof index !== "number" || index < 1 || index > maxPosition) {
+      return reply.code(400).send({
+        status: "error",
+        message: `index must be a number in range 1..${maxPosition}`,
+      });
+    }
+
+    const topics = latest.queue
+      .filter((_, i) => i !== index - 1)
+      .map((item) => item.topic);
+    const queue = buildQueueFromTopics(topics, latest.queue);
+    await saveLatestPlan({ ...latest, queue });
+
+    return {
+      status: "ok",
+      queueId: latest.queueId,
+      queue,
     };
   });
 
