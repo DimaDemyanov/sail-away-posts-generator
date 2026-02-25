@@ -68,8 +68,13 @@ For planning and drafting:
 2. Build structured context (themes, tone, performance patterns, recent gaps).
 3. Generate output via LLM:
    - `plan_next_10`: list of 10 post ideas with rationale and schedule slot.
-   - `draft_post`: full text + image options.
+   - `draft_post`: full text + image options + retrieval hints (`topicKeywords`, `mustHaveKeywords`, `excludeKeywords`) in the same response.
 4. Store source post references for traceability.
+5. Build references from all similar-channel history using hybrid scoring:
+   - semantic similarity (embeddings)
+   - lexical similarity by LLM-provided keywords
+   - optional required/excluded keyword constraints
+   - boost for `sourcePostIds` returned by draft generation
 
 ## Core Features
 

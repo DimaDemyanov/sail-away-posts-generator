@@ -4,6 +4,8 @@ import type { IndexedPost } from "./history";
 
 const MAX_DRAFT_RETRIEVAL_POSTS = 1200;
 const EMBEDDING_BATCH_SIZE = 128;
+const REFERENCE_EMBED_BATCH_SIZE = 64;
+const REFERENCE_EMBED_TEXT_MAX = 320;
 const LLM_LOG_MAX_CHARS = 1200;
 
 export interface DraftOptions {
@@ -33,6 +35,15 @@ interface DraftModelResponse {
   text?: string;
   imageOptions?: string[];
   sourcePostIds?: string[];
+  topicKeywords?: string[];
+  mustHaveKeywords?: string[];
+  excludeKeywords?: string[];
+}
+
+interface DraftKeywordHints {
+  topicKeywords: string[];
+  mustHaveKeywords: string[];
+  excludeKeywords: string[];
 }
 
 function clip(text: string, max = LLM_LOG_MAX_CHARS): string {
@@ -84,14 +95,15 @@ async function embedTexts(
   client: OpenAI,
   model: string,
   inputs: string[],
+  batchSize = EMBEDDING_BATCH_SIZE,
 ): Promise<number[][]> {
   if (inputs.length === 0) {
     return [];
   }
 
   const embeddings: number[][] = [];
-  for (let i = 0; i < inputs.length; i += EMBEDDING_BATCH_SIZE) {
-    const chunk = inputs.slice(i, i + EMBEDDING_BATCH_SIZE);
+  for (let i = 0; i < inputs.length; i += batchSize) {
+    const chunk = inputs.slice(i, i + batchSize);
     const res = await client.embeddings.create({ model, input: chunk });
     embeddings.push(...res.data.map((item) => item.embedding));
   }
@@ -114,6 +126,132 @@ function retrieveForTopic(
     .map((entry) => entry.post);
 }
 
+function tokenize(text: string): string[] {
+  return normalize(text)
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .split(/\s+/)
+    .filter((token) => token.length >= 3);
+}
+
+function buildTokenSet(text: string): Set<string> {
+  return new Set(tokenize(text));
+}
+
+function lexicalOverlapScore(topicTokens: string[], textTokens: Set<string>): number {
+  if (topicTokens.length === 0) return 0;
+  let hits = 0;
+  for (const token of topicTokens) {
+    if (textTokens.has(token)) {
+      hits += 1;
+      continue;
+    }
+
+    // Мягкий матч по префиксу для русских словоформ.
+    if (token.length >= 6) {
+      const prefix = token.slice(0, 5);
+      for (const tt of textTokens) {
+        if (tt.startsWith(prefix)) {
+          hits += 0.6;
+          break;
+        }
+      }
+    }
+  }
+  return hits / topicTokens.length;
+}
+
+export function buildReferencesForTopic(
+  topic: string,
+  topicEmbedding: number[],
+  posts: IndexedPost[],
+  postEmbeddings: number[][],
+  hints?: Partial<DraftKeywordHints>,
+): DraftReference[] {
+  const topicTokens = tokenize(topic);
+  const hintTopicTokens =
+    (hints?.topicKeywords ?? []).flatMap((item) => tokenize(item)).slice(0, 20);
+  const mustTokens =
+    (hints?.mustHaveKeywords ?? []).flatMap((item) => tokenize(item)).slice(0, 20);
+  const excludeTokens =
+    (hints?.excludeKeywords ?? []).flatMap((item) => tokenize(item)).slice(0, 20);
+  const lexicalTopic = hintTopicTokens.length > 0 ? hintTopicTokens : topicTokens;
+
+  const ranked = posts
+    .map((post, idx) => {
+      const emb = cosineSimilarity(topicEmbedding, postEmbeddings[idx] ?? []);
+      const textTokens = buildTokenSet(post.text);
+      const lex = lexicalOverlapScore(lexicalTopic, textTokens);
+      const mustMatch =
+        mustTokens.length === 0 ? 1 : lexicalOverlapScore(mustTokens, textTokens);
+      const excludeMatch =
+        excludeTokens.length === 0 ? 0 : lexicalOverlapScore(excludeTokens, textTokens);
+      // Гибрид: больше веса семантике (embedding).
+      const score =
+        emb * 0.65 + lex * 0.25 + mustMatch * 0.15 - excludeMatch * 0.15;
+      return { post, score, mustMatch };
+    })
+    .filter((entry) => isSimilarSource(entry.post))
+    .filter((entry) => mustTokens.length === 0 || entry.mustMatch > 0)
+    .sort((a, b) => b.score - a.score);
+
+  const result: DraftReference[] = [];
+  const seenIds = new Set<string>();
+  const perChannel = new Map<string, number>();
+
+  for (const entry of ranked) {
+    if (result.length >= 5) break;
+    if (seenIds.has(entry.post.id)) continue;
+
+    const channel = entry.post.channel || "unknown";
+    const used = perChannel.get(channel) ?? 0;
+    if (used >= 2) continue; // немного разнообразия по каналам
+
+    seenIds.add(entry.post.id);
+    perChannel.set(channel, used + 1);
+    result.push({
+      id: entry.post.id,
+      channel: entry.post.channel,
+      snippet: truncate(entry.post.text, 140),
+      url: tryBuildTelegramUrl(entry.post),
+    });
+  }
+
+  return result;
+}
+
+function buildDirectReferencesFromSourceIds(
+  sourcePostIds: string[],
+  similarPosts: IndexedPost[],
+): DraftReference[] {
+  if (sourcePostIds.length === 0) return [];
+  const byId = new Map<string, IndexedPost[]>();
+  for (const post of similarPosts) {
+    if (!isSimilarSource(post)) continue;
+    const list = byId.get(post.id) ?? [];
+    list.push(post);
+    byId.set(post.id, list);
+  }
+
+  const refs: DraftReference[] = [];
+  const seen = new Set<string>();
+  for (const id of sourcePostIds) {
+    const candidates = byId.get(id);
+    if (!candidates || candidates.length === 0) continue;
+    const post = candidates[0];
+    if (seen.has(post.id)) continue;
+    seen.add(post.id);
+    refs.push({
+      id: post.id,
+      channel: post.channel,
+      snippet: truncate(post.text, 140),
+      url: tryBuildTelegramUrl(post),
+    });
+    if (refs.length >= 5) break;
+  }
+  return refs;
+}
+
 function parseDraftResponse(raw: string): DraftModelResponse | null {
   const start = raw.indexOf("{");
   const end = raw.lastIndexOf("}");
@@ -124,6 +262,15 @@ function parseDraftResponse(raw: string): DraftModelResponse | null {
   } catch {
     return null;
   }
+}
+
+function sanitizeStringArray(value: unknown, maxItems: number): string[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((item): item is string => typeof item === "string")
+    .map((item) => normalize(item))
+    .filter((item) => item.length > 0)
+    .slice(0, maxItems);
 }
 
 function isSimilarSource(post: IndexedPost): boolean {
@@ -162,14 +309,26 @@ export async function buildDraftPostRag(
   const client = new OpenAI({ apiKey: options.apiKey });
   const candidatePosts = posts.slice(0, MAX_DRAFT_RETRIEVAL_POSTS);
   const postTexts = candidatePosts.map((post) => truncate(post.text, 900));
+  const similarPostsAll = posts.filter((post) => isSimilarSource(post));
+  const similarPostTextsAll = similarPostsAll.map((post) =>
+    truncate(post.text, REFERENCE_EMBED_TEXT_MAX),
+  );
 
-  const [topicEmbeddingSet, postEmbeddings] = await Promise.all([
+  const [topicEmbeddingSet, postEmbeddings, similarPostEmbeddingsAll] =
+    await Promise.all([
     embedTexts(client, options.embeddingModel, [topic]),
     embedTexts(client, options.embeddingModel, postTexts),
+    embedTexts(
+      client,
+      options.embeddingModel,
+      similarPostTextsAll,
+      REFERENCE_EMBED_BATCH_SIZE,
+    ),
   ]);
 
+  const topicEmbedding = topicEmbeddingSet[0] ?? [];
   const retrieved = retrieveForTopic(
-    topicEmbeddingSet[0] ?? [],
+    topicEmbedding,
     candidatePosts,
     postEmbeddings,
     options.topK,
@@ -190,11 +349,14 @@ export async function buildDraftPostRag(
     "Избегай узкого профессионального жаргона. Если термин нужен, объясни его простыми словами.",
     "Избегай историй, завязанных на конкретных людях и их личных кейсах.",
     "Верни строго JSON-объект формата:",
-    '{"text":"...","imageOptions":["...","...","..."],"sourcePostIds":["..."]}',
+    '{"text":"...","imageOptions":["...","...","..."],"sourcePostIds":["..."],"topicKeywords":["..."],"mustHaveKeywords":["..."],"excludeKeywords":["..."]}',
     "Требования:",
     "- text: 700-1200 символов, живой стиль, без markdown.",
     "- imageOptions: 3 короткие идеи для изображений.",
     "- sourcePostIds: только id из контекста.",
+    "- topicKeywords: 5-10 ключевых слов/фраз для подбора похожих постов.",
+    "- mustHaveKeywords: 0-5 обязательных слов/фраз для референсов.",
+    "- excludeKeywords: 0-5 слов/фраз, которые нерелевантны теме.",
     "",
     "Контекст:",
     evidence,
@@ -241,22 +403,37 @@ export async function buildDraftPostRag(
       : [];
 
   const sourceIdsFromContext = new Set(retrieved.map((p) => p.id));
+  const sourcePostIdsRaw = sanitizeStringArray(parsed.sourcePostIds, 20);
   const sourcePostIds =
-    Array.isArray(parsed.sourcePostIds) && parsed.sourcePostIds.length > 0
-      ? parsed.sourcePostIds
-          .filter((id): id is string => typeof id === "string")
-          .filter((id) => sourceIdsFromContext.has(id))
+    sourcePostIdsRaw.length > 0
+      ? sourcePostIdsRaw.filter((id) => sourceIdsFromContext.has(id))
       : retrieved.map((p) => p.id);
 
-  const references: DraftReference[] = retrieved
-    .filter((post) => isSimilarSource(post))
-    .slice(0, 5)
-    .map((post) => ({
-      id: post.id,
-      channel: post.channel,
-      snippet: truncate(post.text, 140),
-      url: tryBuildTelegramUrl(post),
-    }));
+  const keywordHints: DraftKeywordHints = {
+    topicKeywords: sanitizeStringArray(parsed.topicKeywords, 10),
+    mustHaveKeywords: sanitizeStringArray(parsed.mustHaveKeywords, 5),
+    excludeKeywords: sanitizeStringArray(parsed.excludeKeywords, 5),
+  };
+
+  const directReferences = buildDirectReferencesFromSourceIds(
+    sourcePostIds,
+    similarPostsAll,
+  );
+  const rankedReferences = buildReferencesForTopic(
+    topic,
+    topicEmbedding,
+    similarPostsAll,
+    similarPostEmbeddingsAll,
+    keywordHints,
+  );
+  const references: DraftReference[] = [];
+  const seenRefIds = new Set<string>();
+  for (const ref of [...directReferences, ...rankedReferences]) {
+    if (seenRefIds.has(ref.id)) continue;
+    seenRefIds.add(ref.id);
+    references.push(ref);
+    if (references.length >= 5) break;
+  }
 
   return {
     topic,

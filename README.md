@@ -32,6 +32,17 @@ npm run dev:bot:env
 - `POST /queue/swap` -> swap two queue positions
 - `POST /draft` -> generate draft by `queueItem` (1..10) or by `topic`
 
+### Draft RAG notes
+- One LLM call returns:
+  - `text`, `imageOptions`, `sourcePostIds`
+  - `topicKeywords`, `mustHaveKeywords`, `excludeKeywords`
+- References are selected from all `history/similar/**/*.json` posts using:
+  - embedding similarity
+  - lexical match by `topicKeywords`
+  - required-match filter by `mustHaveKeywords`
+  - penalty by `excludeKeywords`
+  - score boost for posts whose IDs are in `sourcePostIds`
+
 ### Example requests
 ```bash
 curl http://localhost:3000/queue/suggest10
