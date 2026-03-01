@@ -6,6 +6,8 @@ const MAX_DRAFT_RETRIEVAL_POSTS = 1200;
 const EMBEDDING_BATCH_SIZE = 128;
 const REFERENCE_EMBED_BATCH_SIZE = 64;
 const REFERENCE_EMBED_TEXT_MAX = 320;
+const REFERENCE_MIN_SCORE = 0.45;
+const REFERENCE_MIN_LEXICAL = 0.12;
 const LLM_LOG_MAX_CHARS = 1200;
 
 export interface DraftOptions {
@@ -37,12 +39,14 @@ interface DraftModelResponse {
   sourcePostIds?: string[];
   topicKeywords?: string[];
   mustHaveKeywords?: string[];
+  mustHaveSynonyms?: string[];
   excludeKeywords?: string[];
 }
 
 interface DraftKeywordHints {
   topicKeywords: string[];
   mustHaveKeywords: string[];
+  mustHaveSynonyms: string[];
   excludeKeywords: string[];
 }
 
@@ -171,8 +175,12 @@ export function buildReferencesForTopic(
   const topicTokens = tokenize(topic);
   const hintTopicTokens =
     (hints?.topicKeywords ?? []).flatMap((item) => tokenize(item)).slice(0, 20);
-  const mustTokens =
-    (hints?.mustHaveKeywords ?? []).flatMap((item) => tokenize(item)).slice(0, 20);
+  const mustTokens = [
+    ...(hints?.mustHaveKeywords ?? []),
+    ...(hints?.mustHaveSynonyms ?? []),
+  ]
+    .flatMap((item) => tokenize(item))
+    .slice(0, 30);
   const excludeTokens =
     (hints?.excludeKeywords ?? []).flatMap((item) => tokenize(item)).slice(0, 20);
   const lexicalTopic = hintTopicTokens.length > 0 ? hintTopicTokens : topicTokens;
@@ -189,26 +197,20 @@ export function buildReferencesForTopic(
       // Гибрид: больше веса семантике (embedding).
       const score =
         emb * 0.65 + lex * 0.25 + mustMatch * 0.15 - excludeMatch * 0.15;
-      return { post, score, mustMatch };
+      return { post, score, mustMatch, lex };
     })
     .filter((entry) => isSimilarSource(entry.post))
-    .filter((entry) => mustTokens.length === 0 || entry.mustMatch > 0)
+    .filter((entry) => entry.score >= REFERENCE_MIN_SCORE)
+    .filter((entry) => entry.lex >= REFERENCE_MIN_LEXICAL || entry.mustMatch > 0)
     .sort((a, b) => b.score - a.score);
 
   const result: DraftReference[] = [];
   const seenIds = new Set<string>();
-  const perChannel = new Map<string, number>();
 
   for (const entry of ranked) {
-    if (result.length >= 5) break;
     if (seenIds.has(entry.post.id)) continue;
 
-    const channel = entry.post.channel || "unknown";
-    const used = perChannel.get(channel) ?? 0;
-    if (used >= 2) continue; // немного разнообразия по каналам
-
     seenIds.add(entry.post.id);
-    perChannel.set(channel, used + 1);
     result.push({
       id: entry.post.id,
       channel: entry.post.channel,
@@ -218,38 +220,6 @@ export function buildReferencesForTopic(
   }
 
   return result;
-}
-
-function buildDirectReferencesFromSourceIds(
-  sourcePostIds: string[],
-  similarPosts: IndexedPost[],
-): DraftReference[] {
-  if (sourcePostIds.length === 0) return [];
-  const byId = new Map<string, IndexedPost[]>();
-  for (const post of similarPosts) {
-    if (!isSimilarSource(post)) continue;
-    const list = byId.get(post.id) ?? [];
-    list.push(post);
-    byId.set(post.id, list);
-  }
-
-  const refs: DraftReference[] = [];
-  const seen = new Set<string>();
-  for (const id of sourcePostIds) {
-    const candidates = byId.get(id);
-    if (!candidates || candidates.length === 0) continue;
-    const post = candidates[0];
-    if (seen.has(post.id)) continue;
-    seen.add(post.id);
-    refs.push({
-      id: post.id,
-      channel: post.channel,
-      snippet: truncate(post.text, 140),
-      url: tryBuildTelegramUrl(post),
-    });
-    if (refs.length >= 5) break;
-  }
-  return refs;
 }
 
 function parseDraftResponse(raw: string): DraftModelResponse | null {
@@ -349,13 +319,14 @@ export async function buildDraftPostRag(
     "Избегай узкого профессионального жаргона. Если термин нужен, объясни его простыми словами.",
     "Избегай историй, завязанных на конкретных людях и их личных кейсах.",
     "Верни строго JSON-объект формата:",
-    '{"text":"...","imageOptions":["...","...","..."],"sourcePostIds":["..."],"topicKeywords":["..."],"mustHaveKeywords":["..."],"excludeKeywords":["..."]}',
+    '{"text":"...","imageOptions":["...","...","..."],"sourcePostIds":["..."],"topicKeywords":["..."],"mustHaveKeywords":["..."],"mustHaveSynonyms":["..."],"excludeKeywords":["..."]}',
     "Требования:",
     "- text: 700-1200 символов, живой стиль, без markdown.",
     "- imageOptions: 3 короткие идеи для изображений.",
     "- sourcePostIds: только id из контекста.",
     "- topicKeywords: 5-10 ключевых слов/фраз для подбора похожих постов.",
     "- mustHaveKeywords: 0-5 обязательных слов/фраз для референсов.",
+    "- mustHaveSynonyms: 0-20 синонимов/перефразировок к mustHaveKeywords.",
     "- excludeKeywords: 0-5 слов/фраз, которые нерелевантны теме.",
     "",
     "Контекст:",
@@ -412,28 +383,17 @@ export async function buildDraftPostRag(
   const keywordHints: DraftKeywordHints = {
     topicKeywords: sanitizeStringArray(parsed.topicKeywords, 10),
     mustHaveKeywords: sanitizeStringArray(parsed.mustHaveKeywords, 5),
+    mustHaveSynonyms: sanitizeStringArray(parsed.mustHaveSynonyms, 20),
     excludeKeywords: sanitizeStringArray(parsed.excludeKeywords, 5),
   };
 
-  const directReferences = buildDirectReferencesFromSourceIds(
-    sourcePostIds,
-    similarPostsAll,
-  );
-  const rankedReferences = buildReferencesForTopic(
+  const references = buildReferencesForTopic(
     topic,
     topicEmbedding,
     similarPostsAll,
     similarPostEmbeddingsAll,
     keywordHints,
   );
-  const references: DraftReference[] = [];
-  const seenRefIds = new Set<string>();
-  for (const ref of [...directReferences, ...rankedReferences]) {
-    if (seenRefIds.has(ref.id)) continue;
-    seenRefIds.add(ref.id);
-    references.push(ref);
-    if (references.length >= 5) break;
-  }
 
   return {
     topic,

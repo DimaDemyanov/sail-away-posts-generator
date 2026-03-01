@@ -107,7 +107,7 @@ test("buildReferencesForTopic ignores non-similar sources", () => {
   assert.deepEqual(refs.map((r) => r.id), ["202"]);
 });
 
-test("buildReferencesForTopic keeps channel diversity (max 2 per channel)", () => {
+test("buildReferencesForTopic returns all truly similar posts", () => {
   const topic = "Яхтинг для новичков";
   const topicEmbedding = [1, 0];
   const posts: IndexedPost[] = [
@@ -160,9 +160,11 @@ test("buildReferencesForTopic keeps channel diversity (max 2 per channel)", () =
   ];
 
   const refs = buildReferencesForTopic(topic, topicEmbedding, posts, embeddings);
-  const channelA = refs.filter((r) => r.channel === "A").length;
-  assert.equal(channelA, 2);
-  assert.ok(refs.some((r) => r.channel === "B"));
+  assert.equal(refs.length, 4);
+  assert.deepEqual(
+    new Set(refs.map((r) => r.id)),
+    new Set(["301", "302", "303", "304"]),
+  );
 });
 
 test("buildReferencesForTopic keeps semantic priority when lexical signal is close", () => {
@@ -254,4 +256,80 @@ test("buildReferencesForTopic applies must/exclude keywords", () => {
 
   assert.equal(refs[0]?.id, "m1");
   assert.ok(refs.every((r) => r.id !== "m2"));
+});
+
+test("buildReferencesForTopic returns empty when nothing is truly similar", () => {
+  const topic = "Аптечка на яхте";
+  const topicEmbedding = [1, 0];
+  const posts: IndexedPost[] = [
+    {
+      id: "n1",
+      channel: "A",
+      platform: "telegram",
+      published_at: "2026-02-01T00:00:00.000Z",
+      text: "Лучшие пляжи и коктейли у берега",
+      media: [],
+      metrics: {},
+      sourceFile: "/tmp/history/similar/a.json",
+    },
+    {
+      id: "n2",
+      channel: "B",
+      platform: "telegram",
+      published_at: "2026-02-01T00:00:00.000Z",
+      text: "Вечеринка на катамаране и музыка",
+      media: [],
+      metrics: {},
+      sourceFile: "/tmp/history/similar/b.json",
+    },
+  ];
+  const embeddings = [
+    [0.2, 0.8],
+    [0.1, 0.9],
+  ];
+
+  const refs = buildReferencesForTopic(topic, topicEmbedding, posts, embeddings, {
+    topicKeywords: ["аптечка", "первая помощь"],
+  });
+
+  assert.deepEqual(refs, []);
+});
+
+test("buildReferencesForTopic uses mustHaveSynonyms for topic variants", () => {
+  const topic = "Аптечка на яхте";
+  const topicEmbedding = [1, 0];
+  const posts: IndexedPost[] = [
+    {
+      id: "s1",
+      channel: "A",
+      platform: "telegram",
+      published_at: "2026-02-01T00:00:00.000Z",
+      text: "Набор первой помощи на борту: базовый список",
+      media: [],
+      metrics: {},
+      sourceFile: "/tmp/history/similar/a.json",
+    },
+    {
+      id: "s2",
+      channel: "B",
+      platform: "telegram",
+      published_at: "2026-02-01T00:00:00.000Z",
+      text: "Музыка и вечеринки в марине",
+      media: [],
+      metrics: {},
+      sourceFile: "/tmp/history/similar/b.json",
+    },
+  ];
+  const embeddings = [
+    [0.9, 0.1],
+    [0.2, 0.8],
+  ];
+
+  const refs = buildReferencesForTopic(topic, topicEmbedding, posts, embeddings, {
+    topicKeywords: ["аптечка", "чек-лист"],
+    mustHaveKeywords: ["аптечка"],
+    mustHaveSynonyms: ["первая помощь", "набор первой помощи"],
+  });
+
+  assert.equal(refs[0]?.id, "s1");
 });
