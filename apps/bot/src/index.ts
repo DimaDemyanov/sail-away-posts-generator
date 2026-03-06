@@ -475,7 +475,17 @@ async function main(): Promise<void> {
       return;
     }
 
+    let progressTimer: NodeJS.Timeout | null = null;
     try {
+      const startedAt = Date.now();
+      await ctx.reply(`Начинаю генерацию черновика для поста #${planItem}...`);
+      progressTimer = setInterval(() => {
+        const elapsedSec = Math.floor((Date.now() - startedAt) / 1000);
+        void ctx.reply(`Генерирую черновик... прошло ${elapsedSec} сек.`).catch((error) => {
+          console.error("[draft:progress.send_error]", { error });
+        });
+      }, 10_000);
+
       const latest = await apiFetch<ApiLatestQueue>(apiBaseUrl, "/queue/latest");
       if (!latest.queueId || !Array.isArray(latest.queue)) {
         await ctx.reply("Нет сохраненной очереди. Сначала вызовите /queuesuggest");
@@ -515,6 +525,10 @@ async function main(): Promise<void> {
       );
     } catch (error) {
       await ctx.reply(`Ошибка draft: ${(error as Error).message}`);
+    } finally {
+      if (progressTimer) {
+        clearInterval(progressTimer);
+      }
     }
   });
 

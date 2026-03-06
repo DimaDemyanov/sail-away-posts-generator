@@ -24,6 +24,9 @@ npm run dev:api:env
 npm run dev:bot:env
 ```
 
+## Deployment
+- See [DEPLOYMENT.md](./DEPLOYMENT.md) for VPS + systemd runbook (`sailaway-api.service`, `sailaway-bot.service`).
+
 ## API (current)
 - `GET /queue/suggest10` -> suggest 10 new topics (without replacing saved queue)
 - `GET /queue/next10` -> generate and save queue for next 10 weeks
