@@ -1,5 +1,5 @@
-import { Markup, Telegraf } from "telegraf";
-import { mkdir, open, unlink } from "node:fs/promises";
+import { Input, Markup, Telegraf } from "telegraf";
+import { mkdir, open, readdir, stat, unlink } from "node:fs/promises";
 import path from "node:path";
 
 interface ApiQueueItem {
@@ -204,6 +204,39 @@ function getCurrentWeekItem(queue: ApiQueueItem[], dateKey: string): ApiQueueIte
   return sorted.at(-1) ?? null;
 }
 
+async function listJsonFiles(rootDir: string): Promise<string[]> {
+  const out: string[] = [];
+  const entries = await readdir(rootDir, { withFileTypes: true });
+  for (const entry of entries) {
+    const fullPath = path.join(rootDir, entry.name);
+    if (entry.isDirectory()) {
+      out.push(...(await listJsonFiles(fullPath)));
+      continue;
+    }
+    if (entry.isFile() && entry.name.endsWith(".json")) {
+      out.push(fullPath);
+    }
+  }
+  return out;
+}
+
+async function pickLatestJsonFile(rootDir: string): Promise<string | null> {
+  const files = await listJsonFiles(rootDir);
+  if (files.length === 0) {
+    return null;
+  }
+  let latestFile = files[0];
+  let latestMtimeMs = (await stat(latestFile)).mtimeMs;
+  for (const filePath of files.slice(1)) {
+    const mtimeMs = (await stat(filePath)).mtimeMs;
+    if (mtimeMs > latestMtimeMs) {
+      latestMtimeMs = mtimeMs;
+      latestFile = filePath;
+    }
+  }
+  return latestFile;
+}
+
 async function acquireSchedulerLock(): Promise<{
   acquired: boolean;
   release: () => Promise<void>;
@@ -239,6 +272,7 @@ async function main(): Promise<void> {
   const botTimeZone = getOptionalEnv("BOT_TIMEZONE", "Europe/Moscow");
   const weeklyPostHour = Number(getOptionalEnv("WEEKLY_POST_HOUR", "9"));
   const weeklyPostMinute = Number(getOptionalEnv("WEEKLY_POST_MINUTE", "0"));
+  const historyRoot = getOptionalEnv("HISTORY_ROOT", path.resolve(process.cwd(), "history"));
 
   const bot = new Telegraf(botToken);
   const replaceModeUsers = new Set<number>();
@@ -353,6 +387,34 @@ async function main(): Promise<void> {
     }
   };
 
+  const sendWeeklyHistoryFile = async (chatIds: number[], dateKey: string): Promise<void> => {
+    let latestJsonPath: string | null = null;
+    try {
+      latestJsonPath = await pickLatestJsonFile(historyRoot);
+    } catch (error) {
+      console.error("[scheduler:history.find_error]", { historyRoot, error });
+      return;
+    }
+    if (!latestJsonPath) {
+      console.warn("[scheduler:history.empty]", { historyRoot });
+      return;
+    }
+
+    const caption = [
+      "Еженедельная выгрузка файла истории",
+      `date: ${dateKey}`,
+      `file: ${path.relative(process.cwd(), latestJsonPath)}`,
+    ].join("\n");
+    for (const chatId of chatIds) {
+      try {
+        await bot.telegram.sendDocument(chatId, Input.fromLocalFile(latestJsonPath), { caption });
+        console.info("[scheduler:history.sent]", { chatId, dateKey, file: latestJsonPath });
+      } catch (error) {
+        console.error("[scheduler:history.send_error]", { chatId, dateKey, file: latestJsonPath, error });
+      }
+    }
+  };
+
   await bot.telegram.setMyCommands([
     { command: "start", description: "Показать справку" },
     { command: "queue", description: "Показать текущую очередь постов" },
@@ -363,6 +425,7 @@ async function main(): Promise<void> {
     { command: "swapposts", description: "Поменять 2 поста местами: /swapposts 2 5" },
     { command: "queuesuggest", description: "Предложить 10 новых тем (без замены очереди)" },
     { command: "draft", description: "Сгенерировать черновик: /draft 1" },
+    { command: "historyjson", description: "Скачать актуальный JSON истории" },
     { command: "scheduler_test", description: "Тест: сразу отправить драфт и напоминание" },
   ]);
 
@@ -384,6 +447,7 @@ async function main(): Promise<void> {
         "/swapposts <from> <to>",
         "/queuesuggest",
         "/draft <номер_поста>",
+        "/historyjson",
       ].join("\n"),
     );
   });
@@ -632,6 +696,28 @@ async function main(): Promise<void> {
     }
   });
 
+  bot.command("historyjson", async (ctx) => {
+    if (!ensureAllowed(ctx.from.id, adminIds)) {
+      await ctx.reply("Доступ запрещен.");
+      return;
+    }
+    try {
+      const latestJsonPath = await pickLatestJsonFile(historyRoot);
+      if (!latestJsonPath) {
+        await ctx.reply(`Файлы истории не найдены в ${historyRoot}`);
+        return;
+      }
+      const caption = [
+        "Актуальный файл истории",
+        `file: ${path.relative(process.cwd(), latestJsonPath)}`,
+      ].join("\n");
+      await bot.telegram.sendDocument(ctx.chat.id, Input.fromLocalFile(latestJsonPath), { caption });
+    } catch (error) {
+      console.error("[command:historyjson.error]", { error });
+      await ctx.reply(`Ошибка historyjson: ${(error as Error).message}`);
+    }
+  });
+
   bot.action(/^wk_(delete_yes|keep|delete_no)\|([^|]+)\|(\d+)$/, async (ctx) => {
     if (!ctx.from || !ensureAllowed(ctx.from.id, adminIds)) {
       await ctx.answerCbQuery("Доступ запрещен.");
@@ -749,6 +835,7 @@ async function main(): Promise<void> {
   let lastWeeklyPublicationDate = "";
   let lastDraftSlotKey = "";
   let lastReminderSlotKey = "";
+  let lastHistorySlotKey = "";
   let schedulerInProgress = false;
   const runSchedulers = async (): Promise<void> => {
     if (schedulerInProgress) {
@@ -820,6 +907,25 @@ async function main(): Promise<void> {
           console.error("[scheduler:reminder.error]", error);
         }
         lastReminderSlotKey = reminderSlotKey;
+      }
+
+      // Production mode: Sunday 09:05 UTC history file scheduler.
+      const historySlotKey = `${utc.dateKey}-sun-0905-history`;
+      if (utc.weekday === 0 && utc.hour === 9 && utc.minute === 5 && historySlotKey !== lastHistorySlotKey) {
+        console.info("[scheduler:history.trigger]", {
+          dateKey: utc.dateKey,
+          hourUtc: utc.hour,
+          minuteUtc: utc.minute,
+          slot: historySlotKey,
+          targets: targets.length,
+          historyRoot,
+        });
+        try {
+          await sendWeeklyHistoryFile(targets, utc.dateKey);
+        } catch (error) {
+          console.error("[scheduler:history.error]", error);
+        }
+        lastHistorySlotKey = historySlotKey;
       }
     } catch (error) {
       console.error("weekly queue publish failed", error);

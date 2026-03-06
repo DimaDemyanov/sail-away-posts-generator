@@ -68,14 +68,17 @@ curl -X POST http://localhost:3000/draft \
 - `/addtopic <тема>` -> add one topic to the end of queue
 - `/removetopic <index>` -> remove one topic by position
 - `/swapposts <from> <to>` -> swap queue items
+- `/historyjson` -> download latest history JSON file
 
 ## Weekly Auto-Publish
 Bot auto-sends a new 10-week queue every Sunday.
+Bot also auto-sends the latest `*.json` history file every Sunday at `09:05 UTC`.
 
 Related env vars:
 - `BOT_TIMEZONE` (default `Europe/Moscow`)
 - `WEEKLY_POST_HOUR` (default `9`)
 - `WEEKLY_POST_MINUTE` (default `0`)
+- `HISTORY_ROOT` (default `<project>/history`)
 - `TELEGRAM_TARGET_CHAT_ID` (optional; if empty, sends to admin IDs)
 
 ## Required env vars
